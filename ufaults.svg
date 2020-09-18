@@ -1,0 +1,4168 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2134" onload="init(evt)" viewBox="0 0 1200 2134" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="2134.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >fault count</text>
+<text id="details" x="10.00" y="2117" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="2117" > </text>
+<g id="frames">
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1153.5" y="2021" width="2.5" height="15.0" fill="rgb(239,228,13)" rx="2" ry="2" />
+<text  x="1156.54" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1075.8" y="1781" width="1.2" height="15.0" fill="rgb(241,22,49)" rx="2" ry="2" />
+<text  x="1078.77" y="1791.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1145.0" y="2021" width="1.3" height="15.0" fill="rgb(227,217,49)" rx="2" ry="2" />
+<text  x="1148.04" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1121.9" y="1989" width="1.3" height="15.0" fill="rgb(248,21,18)" rx="2" ry="2" />
+<text  x="1124.95" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1237" width="1.2" height="15.0" fill="rgb(218,39,47)" rx="2" ry="2" />
+<text  x="20.29" y="1247.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="469" width="1.2" height="15.0" fill="rgb(249,108,26)" rx="2" ry="2" />
+<text  x="20.29" y="479.5" ></text>
+</g>
+<g >
+<title>[unknown] (18 times, 1.85%)</title><rect x="1074.6" y="2053" width="21.8" height="15.0" fill="rgb(248,119,33)" rx="2" ry="2" />
+<text  x="1077.55" y="2063.5" >[..</text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="47.7" y="2021" width="1.2" height="15.0" fill="rgb(236,216,3)" rx="2" ry="2" />
+<text  x="50.67" y="2031.5" ></text>
+</g>
+<g >
+<title>_IO_fflush (1 times, 0.10%)</title><rect x="1115.9" y="2037" width="1.2" height="15.0" fill="rgb(249,127,20)" rx="2" ry="2" />
+<text  x="1118.87" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1153.5" y="1989" width="2.5" height="15.0" fill="rgb(244,101,44)" rx="2" ry="2" />
+<text  x="1156.54" y="1999.5" ></text>
+</g>
+<g >
+<title>_start (1 times, 0.10%)</title><rect x="1180.3" y="2053" width="1.2" height="15.0" fill="rgb(219,26,5)" rx="2" ry="2" />
+<text  x="1183.28" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1141.4" y="2021" width="1.2" height="15.0" fill="rgb(223,194,49)" rx="2" ry="2" />
+<text  x="1144.39" y="2031.5" ></text>
+</g>
+<g >
+<title>__wcsnlen_ifunc (1 times, 0.10%)</title><rect x="454.8" y="2005" width="1.2" height="15.0" fill="rgb(222,49,25)" rx="2" ry="2" />
+<text  x="457.78" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1119.5" y="1989" width="1.2" height="15.0" fill="rgb(250,152,17)" rx="2" ry="2" />
+<text  x="1122.52" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="449.9" y="1957" width="1.2" height="15.0" fill="rgb(242,151,28)" rx="2" ry="2" />
+<text  x="452.92" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="141.2" y="1973" width="1.3" height="15.0" fill="rgb(233,156,42)" rx="2" ry="2" />
+<text  x="144.25" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="160.7" y="1909" width="1.2" height="15.0" fill="rgb(254,191,53)" rx="2" ry="2" />
+<text  x="163.69" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="773" width="1.2" height="15.0" fill="rgb(218,20,48)" rx="2" ry="2" />
+<text  x="20.29" y="783.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="133" width="1.2" height="15.0" fill="rgb(243,212,18)" rx="2" ry="2" />
+<text  x="20.29" y="143.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="84.1" y="2021" width="1.2" height="15.0" fill="rgb(254,51,22)" rx="2" ry="2" />
+<text  x="87.13" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (54 times, 5.56%)</title><rect x="13.6" y="2053" width="65.7" height="15.0" fill="rgb(234,111,47)" rx="2" ry="2" />
+<text  x="16.65" y="2063.5" >[unknown]</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="131.5" y="2005" width="1.2" height="15.0" fill="rgb(250,157,48)" rx="2" ry="2" />
+<text  x="134.52" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="17.3" y="53" width="1.2" height="15.0" fill="rgb(222,148,32)" rx="2" ry="2" />
+<text  x="20.29" y="63.5" ></text>
+</g>
+<g >
+<title>_dl_sysdep_start (1 times, 0.10%)</title><rect x="1160.8" y="2037" width="1.2" height="15.0" fill="rgb(244,115,39)" rx="2" ry="2" />
+<text  x="1163.83" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="135.2" y="2021" width="1.2" height="15.0" fill="rgb(215,2,36)" rx="2" ry="2" />
+<text  x="138.17" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="1132.9" y="1989" width="4.8" height="15.0" fill="rgb(221,183,24)" rx="2" ry="2" />
+<text  x="1135.88" y="1999.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (8 times, 0.82%)</title><rect x="1064.8" y="1925" width="9.8" height="15.0" fill="rgb(212,47,21)" rx="2" ry="2" />
+<text  x="1067.83" y="1935.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="19.7" y="1925" width="1.2" height="15.0" fill="rgb(248,164,50)" rx="2" ry="2" />
+<text  x="22.72" y="1935.5" ></text>
+</g>
+<g >
+<title>_dl_new_object (1 times, 0.10%)</title><rect x="1120.7" y="2037" width="1.2" height="15.0" fill="rgb(246,221,2)" rx="2" ry="2" />
+<text  x="1123.73" y="2047.5" ></text>
+</g>
+<g >
+<title>Perl_sys_init3 (2 times, 0.21%)</title><rect x="118.2" y="2053" width="2.4" height="15.0" fill="rgb(246,135,40)" rx="2" ry="2" />
+<text  x="121.16" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="565" width="1.2" height="15.0" fill="rgb(215,125,6)" rx="2" ry="2" />
+<text  x="20.29" y="575.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1074.6" y="1845" width="1.2" height="15.0" fill="rgb(253,190,13)" rx="2" ry="2" />
+<text  x="1077.55" y="1855.5" ></text>
+</g>
+<g >
+<title>check_match (1 times, 0.10%)</title><rect x="1181.5" y="2053" width="1.2" height="15.0" fill="rgb(223,133,14)" rx="2" ry="2" />
+<text  x="1184.49" y="2063.5" ></text>
+</g>
+<g >
+<title>setlocale (3 times, 0.31%)</title><rect x="1185.1" y="2053" width="3.7" height="15.0" fill="rgb(212,27,6)" rx="2" ry="2" />
+<text  x="1188.14" y="2063.5" ></text>
+</g>
+<g >
+<title>intel_check_word.isra.0 (1 times, 0.10%)</title><rect x="1142.6" y="2037" width="1.2" height="15.0" fill="rgb(233,73,34)" rx="2" ry="2" />
+<text  x="1145.61" y="2047.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (8 times, 0.82%)</title><rect x="1064.8" y="1989" width="9.8" height="15.0" fill="rgb(253,87,54)" rx="2" ry="2" />
+<text  x="1067.83" y="1999.5" ></text>
+</g>
+<g >
+<title>signal_is_trapped (1 times, 0.10%)</title><rect x="75.6" y="2037" width="1.2" height="15.0" fill="rgb(246,212,45)" rx="2" ry="2" />
+<text  x="78.62" y="2047.5" ></text>
+</g>
+<g >
+<title>_nl_load_locale_from_archive (1 times, 0.10%)</title><rect x="1186.4" y="2021" width="1.2" height="15.0" fill="rgb(250,169,1)" rx="2" ry="2" />
+<text  x="1189.35" y="2031.5" ></text>
+</g>
+<g >
+<title>__memset_sse2_unaligned_erms (157 times, 16.17%)</title><rect x="250.6" y="2037" width="190.8" height="15.0" fill="rgb(246,171,13)" rx="2" ry="2" />
+<text  x="253.62" y="2047.5" >__memset_sse2_unaligned_..</text>
+</g>
+<g >
+<title>give_terminal_to (1 times, 0.10%)</title><rect x="59.8" y="2037" width="1.2" height="15.0" fill="rgb(223,212,5)" rx="2" ry="2" />
+<text  x="62.82" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1118.3" y="2005" width="1.2" height="15.0" fill="rgb(247,50,36)" rx="2" ry="2" />
+<text  x="1121.30" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (19 times, 1.96%)</title><rect x="1041.7" y="2037" width="23.1" height="15.0" fill="rgb(219,105,3)" rx="2" ry="2" />
+<text  x="1044.74" y="2047.5" >p..</text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1765" width="1.2" height="15.0" fill="rgb(214,108,15)" rx="2" ry="2" />
+<text  x="20.29" y="1775.5" ></text>
+</g>
+<g >
+<title>__ctype_init (1 times, 0.10%)</title><rect x="508.2" y="2053" width="1.3" height="15.0" fill="rgb(225,81,44)" rx="2" ry="2" />
+<text  x="511.25" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="228.7" y="2021" width="1.3" height="15.0" fill="rgb(215,63,43)" rx="2" ry="2" />
+<text  x="231.74" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (8 times, 0.82%)</title><rect x="144.9" y="1957" width="9.7" height="15.0" fill="rgb(229,102,7)" rx="2" ry="2" />
+<text  x="147.89" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="61.0" y="1989" width="1.3" height="15.0" fill="rgb(247,183,23)" rx="2" ry="2" />
+<text  x="64.04" y="1999.5" ></text>
+</g>
+<g >
+<title>__perf_mmap__read_init (2 times, 0.21%)</title><rect x="1106.1" y="2021" width="2.5" height="15.0" fill="rgb(229,123,0)" rx="2" ry="2" />
+<text  x="1109.15" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1156.0" y="2005" width="1.2" height="15.0" fill="rgb(207,26,49)" rx="2" ry="2" />
+<text  x="1158.97" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1461" width="1.2" height="15.0" fill="rgb(249,101,41)" rx="2" ry="2" />
+<text  x="20.29" y="1471.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1139.0" y="2005" width="2.4" height="15.0" fill="rgb(227,127,52)" rx="2" ry="2" />
+<text  x="1141.96" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="117" width="1.2" height="15.0" fill="rgb(226,28,16)" rx="2" ry="2" />
+<text  x="20.29" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="901" width="1.2" height="15.0" fill="rgb(216,225,9)" rx="2" ry="2" />
+<text  x="20.29" y="911.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="195.9" y="1957" width="1.2" height="15.0" fill="rgb(228,202,27)" rx="2" ry="2" />
+<text  x="198.93" y="1967.5" ></text>
+</g>
+<g >
+<title>Perl_init_constants (1 times, 0.10%)</title><rect x="132.7" y="2037" width="1.3" height="15.0" fill="rgb(232,151,0)" rx="2" ry="2" />
+<text  x="135.74" y="2047.5" ></text>
+</g>
+<g >
+<title>__cosf_ifunc (1 times, 0.10%)</title><rect x="449.9" y="2005" width="1.2" height="15.0" fill="rgb(217,42,35)" rx="2" ry="2" />
+<text  x="452.92" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (4 times, 0.41%)</title><rect x="1132.9" y="2005" width="4.8" height="15.0" fill="rgb(232,83,6)" rx="2" ry="2" />
+<text  x="1135.88" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (3 times, 0.31%)</title><rect x="13.6" y="2021" width="3.7" height="15.0" fill="rgb(208,57,32)" rx="2" ry="2" />
+<text  x="16.65" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="161.9" y="1973" width="2.4" height="15.0" fill="rgb(235,169,0)" rx="2" ry="2" />
+<text  x="164.91" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="56.2" y="2021" width="1.2" height="15.0" fill="rgb(216,26,13)" rx="2" ry="2" />
+<text  x="59.18" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1183.9" y="2005" width="1.2" height="15.0" fill="rgb(213,229,34)" rx="2" ry="2" />
+<text  x="1186.92" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="457.2" y="1957" width="1.2" height="15.0" fill="rgb(241,221,52)" rx="2" ry="2" />
+<text  x="460.21" y="1967.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1 times, 0.10%)</title><rect x="1075.8" y="1797" width="1.2" height="15.0" fill="rgb(227,3,20)" rx="2" ry="2" />
+<text  x="1078.77" y="1807.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="456.0" y="1973" width="1.2" height="15.0" fill="rgb(247,2,51)" rx="2" ry="2" />
+<text  x="458.99" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="17.3" y="69" width="1.2" height="15.0" fill="rgb(247,193,43)" rx="2" ry="2" />
+<text  x="20.29" y="79.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1104.9" y="2005" width="1.2" height="15.0" fill="rgb(243,191,46)" rx="2" ry="2" />
+<text  x="1107.93" y="2015.5" ></text>
+</g>
+<g >
+<title>perf_evlist__prepare_workload (3 times, 0.31%)</title><rect x="1098.9" y="1989" width="3.6" height="15.0" fill="rgb(225,78,21)" rx="2" ry="2" />
+<text  x="1101.86" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1180.3" y="2005" width="1.2" height="15.0" fill="rgb(211,41,54)" rx="2" ry="2" />
+<text  x="1183.28" y="2015.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1074.6" y="1909" width="1.2" height="15.0" fill="rgb(221,182,9)" rx="2" ry="2" />
+<text  x="1077.55" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="677" width="1.2" height="15.0" fill="rgb(241,131,39)" rx="2" ry="2" />
+<text  x="20.29" y="687.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="448.7" y="1973" width="1.2" height="15.0" fill="rgb(223,77,5)" rx="2" ry="2" />
+<text  x="451.70" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1509" width="1.2" height="15.0" fill="rgb(239,184,22)" rx="2" ry="2" />
+<text  x="20.29" y="1519.5" ></text>
+</g>
+<g >
+<title>do_page_fault (6 times, 0.62%)</title><rect x="1077.0" y="1765" width="7.3" height="15.0" fill="rgb(235,18,26)" rx="2" ry="2" />
+<text  x="1079.98" y="1775.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="159.5" y="1973" width="1.2" height="15.0" fill="rgb(242,98,23)" rx="2" ry="2" />
+<text  x="162.47" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="581" width="1.2" height="15.0" fill="rgb(216,137,6)" rx="2" ry="2" />
+<text  x="20.29" y="591.5" ></text>
+</g>
+<g >
+<title>page_fault (3 times, 0.31%)</title><rect x="80.5" y="2037" width="3.6" height="15.0" fill="rgb(220,167,17)" rx="2" ry="2" />
+<text  x="83.48" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="510.7" y="2005" width="1.2" height="15.0" fill="rgb(237,13,20)" rx="2" ry="2" />
+<text  x="513.68" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1077" width="1.2" height="15.0" fill="rgb(213,116,38)" rx="2" ry="2" />
+<text  x="20.29" y="1087.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="165.6" y="1989" width="1.2" height="15.0" fill="rgb(254,79,15)" rx="2" ry="2" />
+<text  x="168.55" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1186.4" y="1989" width="1.2" height="15.0" fill="rgb(217,84,45)" rx="2" ry="2" />
+<text  x="1189.35" y="1999.5" ></text>
+</g>
+<g >
+<title>perf (9 times, 0.93%)</title><rect x="1097.6" y="2069" width="11.0" height="15.0" fill="rgb(211,177,50)" rx="2" ry="2" />
+<text  x="1100.64" y="2079.5" ></text>
+</g>
+<g >
+<title>_dl_lookup_symbol_x (1 times, 0.10%)</title><rect x="1125.6" y="2005" width="1.2" height="15.0" fill="rgb(220,79,44)" rx="2" ry="2" />
+<text  x="1128.59" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="548.4" y="2005" width="1.2" height="15.0" fill="rgb(243,221,46)" rx="2" ry="2" />
+<text  x="551.35" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (10 times, 1.03%)</title><rect x="521.6" y="2005" width="12.2" height="15.0" fill="rgb(232,214,43)" rx="2" ry="2" />
+<text  x="524.62" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="194.7" y="1989" width="1.2" height="15.0" fill="rgb(213,101,7)" rx="2" ry="2" />
+<text  x="197.72" y="1999.5" ></text>
+</g>
+<g >
+<title>memmove (2 times, 0.21%)</title><rect x="490.0" y="2005" width="2.5" height="15.0" fill="rgb(217,75,54)" rx="2" ry="2" />
+<text  x="493.02" y="2015.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (16 times, 1.65%)</title><rect x="1075.8" y="1893" width="19.4" height="15.0" fill="rgb(248,97,37)" rx="2" ry="2" />
+<text  x="1078.77" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="277" width="1.2" height="15.0" fill="rgb(224,182,29)" rx="2" ry="2" />
+<text  x="20.29" y="287.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1158.4" y="2005" width="2.4" height="15.0" fill="rgb(224,26,44)" rx="2" ry="2" />
+<text  x="1161.40" y="2015.5" ></text>
+</g>
+<g >
+<title>_dl_check_map_versions (1 times, 0.10%)</title><rect x="445.1" y="2037" width="1.2" height="15.0" fill="rgb(224,158,2)" rx="2" ry="2" />
+<text  x="448.06" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="47.7" y="1989" width="1.2" height="15.0" fill="rgb(217,160,41)" rx="2" ry="2" />
+<text  x="50.67" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1333" width="1.2" height="15.0" fill="rgb(247,67,31)" rx="2" ry="2" />
+<text  x="20.29" y="1343.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="293" width="1.2" height="15.0" fill="rgb(228,33,26)" rx="2" ry="2" />
+<text  x="20.29" y="303.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="518.0" y="2005" width="1.2" height="15.0" fill="rgb(240,134,44)" rx="2" ry="2" />
+<text  x="520.97" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="789" width="1.2" height="15.0" fill="rgb(245,111,9)" rx="2" ry="2" />
+<text  x="20.29" y="799.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="453.6" y="1973" width="1.2" height="15.0" fill="rgb(248,125,11)" rx="2" ry="2" />
+<text  x="456.56" y="1983.5" ></text>
+</g>
+<g >
+<title>__GI___getuid (1 times, 0.10%)</title><rect x="164.3" y="2005" width="1.3" height="15.0" fill="rgb(243,181,28)" rx="2" ry="2" />
+<text  x="167.34" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1941" width="1.2" height="15.0" fill="rgb(252,57,14)" rx="2" ry="2" />
+<text  x="20.29" y="1951.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="159.5" y="1989" width="1.2" height="15.0" fill="rgb(211,106,7)" rx="2" ry="2" />
+<text  x="162.47" y="1999.5" ></text>
+</g>
+<g >
+<title>__wmemchr_ifunc (1 times, 0.10%)</title><rect x="456.0" y="2005" width="1.2" height="15.0" fill="rgb(217,74,25)" rx="2" ry="2" />
+<text  x="458.99" y="2015.5" ></text>
+</g>
+<g >
+<title>strchr (1 times, 0.10%)</title><rect x="497.3" y="2005" width="1.2" height="15.0" fill="rgb(217,163,26)" rx="2" ry="2" />
+<text  x="500.31" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="140.0" y="1957" width="1.2" height="15.0" fill="rgb(250,184,21)" rx="2" ry="2" />
+<text  x="143.03" y="1967.5" ></text>
+</g>
+<g >
+<title>_int_malloc (387 times, 39.86%)</title><rect x="555.6" y="2053" width="470.3" height="15.0" fill="rgb(248,147,43)" rx="2" ry="2" />
+<text  x="558.64" y="2063.5" >_int_malloc</text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="545.9" y="1989" width="2.5" height="15.0" fill="rgb(251,35,22)" rx="2" ry="2" />
+<text  x="548.92" y="1999.5" ></text>
+</g>
+<g >
+<title>__ctype_init (1 times, 0.10%)</title><rect x="1143.8" y="2053" width="1.2" height="15.0" fill="rgb(221,78,33)" rx="2" ry="2" />
+<text  x="1146.82" y="2063.5" ></text>
+</g>
+<g >
+<title>strvec_from_word_list (1 times, 0.10%)</title><rect x="76.8" y="2037" width="1.3" height="15.0" fill="rgb(237,221,18)" rx="2" ry="2" />
+<text  x="79.84" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1095.2" y="1781" width="1.2" height="15.0" fill="rgb(227,146,31)" rx="2" ry="2" />
+<text  x="1098.21" y="1791.5" ></text>
+</g>
+<g >
+<title>_rl_set_insert_mode (1 times, 0.10%)</title><rect x="47.7" y="2037" width="1.2" height="15.0" fill="rgb(241,117,41)" rx="2" ry="2" />
+<text  x="50.67" y="2047.5" ></text>
+</g>
+<g >
+<title>Perl_init_uniprops (1 times, 0.10%)</title><rect x="155.8" y="2005" width="1.2" height="15.0" fill="rgb(210,219,51)" rx="2" ry="2" />
+<text  x="158.83" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1097.6" y="1909" width="1.3" height="15.0" fill="rgb(234,31,13)" rx="2" ry="2" />
+<text  x="1100.64" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="885" width="1.2" height="15.0" fill="rgb(252,192,25)" rx="2" ry="2" />
+<text  x="20.29" y="895.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="27.0" y="2021" width="1.2" height="15.0" fill="rgb(222,120,14)" rx="2" ry="2" />
+<text  x="30.01" y="2031.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1095.2" y="1813" width="1.2" height="15.0" fill="rgb(217,172,27)" rx="2" ry="2" />
+<text  x="1098.21" y="1823.5" ></text>
+</g>
+<g >
+<title>Perl_gv_fetchpvn_flags (1 times, 0.10%)</title><rect x="110.9" y="2053" width="1.2" height="15.0" fill="rgb(244,197,1)" rx="2" ry="2" />
+<text  x="113.87" y="2063.5" ></text>
+</g>
+<g >
+<title>__memcpy_chk (1 times, 0.10%)</title><rect x="453.6" y="2005" width="1.2" height="15.0" fill="rgb(254,2,24)" rx="2" ry="2" />
+<text  x="456.56" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1137.7" y="1973" width="1.3" height="15.0" fill="rgb(225,219,39)" rx="2" ry="2" />
+<text  x="1140.74" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="25.8" y="2021" width="1.2" height="15.0" fill="rgb(251,190,15)" rx="2" ry="2" />
+<text  x="28.80" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1605" width="1.2" height="15.0" fill="rgb(245,171,54)" rx="2" ry="2" />
+<text  x="20.29" y="1615.5" ></text>
+</g>
+<g >
+<title>_int_malloc (2 times, 0.21%)</title><rect x="1165.7" y="2053" width="2.4" height="15.0" fill="rgb(233,117,29)" rx="2" ry="2" />
+<text  x="1168.70" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1093" width="1.2" height="15.0" fill="rgb(226,89,54)" rx="2" ry="2" />
+<text  x="20.29" y="1103.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="853" width="1.2" height="15.0" fill="rgb(211,100,47)" rx="2" ry="2" />
+<text  x="20.29" y="863.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="138.8" y="2021" width="1.2" height="15.0" fill="rgb(246,186,26)" rx="2" ry="2" />
+<text  x="141.82" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1157" width="1.2" height="15.0" fill="rgb(222,98,26)" rx="2" ry="2" />
+<text  x="20.29" y="1167.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1621" width="1.2" height="15.0" fill="rgb(238,46,38)" rx="2" ry="2" />
+<text  x="20.29" y="1631.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="13.6" y="2005" width="3.7" height="15.0" fill="rgb(226,22,23)" rx="2" ry="2" />
+<text  x="16.65" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="520.4" y="2021" width="1.2" height="15.0" fill="rgb(246,109,7)" rx="2" ry="2" />
+<text  x="523.40" y="2031.5" ></text>
+</g>
+<g >
+<title>__wmemchr_ifunc (1 times, 0.10%)</title><rect x="1123.2" y="2005" width="1.2" height="15.0" fill="rgb(214,229,22)" rx="2" ry="2" />
+<text  x="1126.16" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="136.4" y="2021" width="1.2" height="15.0" fill="rgb(247,66,17)" rx="2" ry="2" />
+<text  x="139.39" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_sysdep_start (1 times, 0.10%)</title><rect x="548.4" y="2037" width="1.2" height="15.0" fill="rgb(229,83,28)" rx="2" ry="2" />
+<text  x="551.35" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="445.1" y="1989" width="1.2" height="15.0" fill="rgb(206,64,42)" rx="2" ry="2" />
+<text  x="448.06" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1365" width="1.2" height="15.0" fill="rgb(246,208,53)" rx="2" ry="2" />
+<text  x="20.29" y="1375.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="518.0" y="2021" width="1.2" height="15.0" fill="rgb(243,134,1)" rx="2" ry="2" />
+<text  x="520.97" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="59.8" y="1989" width="1.2" height="15.0" fill="rgb(249,211,2)" rx="2" ry="2" />
+<text  x="62.82" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="132.7" y="1989" width="1.3" height="15.0" fill="rgb(230,0,45)" rx="2" ry="2" />
+<text  x="135.74" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="17.3" y="37" width="1.2" height="15.0" fill="rgb(214,54,27)" rx="2" ry="2" />
+<text  x="20.29" y="47.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="76.8" y="2005" width="1.3" height="15.0" fill="rgb(227,163,45)" rx="2" ry="2" />
+<text  x="79.84" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1187.6" y="1989" width="1.2" height="15.0" fill="rgb(228,179,25)" rx="2" ry="2" />
+<text  x="1190.57" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1123.2" y="1957" width="1.2" height="15.0" fill="rgb(231,127,23)" rx="2" ry="2" />
+<text  x="1126.16" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="160.7" y="1941" width="1.2" height="15.0" fill="rgb(238,105,24)" rx="2" ry="2" />
+<text  x="163.69" y="1951.5" ></text>
+</g>
+<g >
+<title>record__mmap_read_evlist.constprop.0 (2 times, 0.21%)</title><rect x="1102.5" y="1989" width="2.4" height="15.0" fill="rgb(206,86,31)" rx="2" ry="2" />
+<text  x="1105.50" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1074.6" y="1861" width="1.2" height="15.0" fill="rgb(218,18,24)" rx="2" ry="2" />
+<text  x="1077.55" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1269" width="1.2" height="15.0" fill="rgb(229,29,26)" rx="2" ry="2" />
+<text  x="20.29" y="1279.5" ></text>
+</g>
+<g >
+<title>_dl_addr (1 times, 0.10%)</title><rect x="518.0" y="2053" width="1.2" height="15.0" fill="rgb(220,5,31)" rx="2" ry="2" />
+<text  x="520.97" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1141.4" y="1989" width="1.2" height="15.0" fill="rgb(246,120,40)" rx="2" ry="2" />
+<text  x="1144.39" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="53.7" y="1941" width="1.3" height="15.0" fill="rgb(209,14,48)" rx="2" ry="2" />
+<text  x="56.75" y="1951.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="510.7" y="2021" width="1.2" height="15.0" fill="rgb(238,63,51)" rx="2" ry="2" />
+<text  x="513.68" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="155.8" y="1957" width="1.2" height="15.0" fill="rgb(237,208,43)" rx="2" ry="2" />
+<text  x="158.83" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="548.4" y="2021" width="1.2" height="15.0" fill="rgb(237,88,24)" rx="2" ry="2" />
+<text  x="551.35" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="22.2" y="1973" width="1.2" height="15.0" fill="rgb(212,33,42)" rx="2" ry="2" />
+<text  x="25.15" y="1983.5" ></text>
+</g>
+<g >
+<title>_dl_start (2 times, 0.21%)</title><rect x="545.9" y="2037" width="2.5" height="15.0" fill="rgb(247,177,51)" rx="2" ry="2" />
+<text  x="548.92" y="2047.5" ></text>
+</g>
+<g >
+<title>__vdso_time (1 times, 0.10%)</title><rect x="515.5" y="2053" width="1.3" height="15.0" fill="rgb(238,166,54)" rx="2" ry="2" />
+<text  x="518.54" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="1126.8" y="1973" width="4.9" height="15.0" fill="rgb(210,206,13)" rx="2" ry="2" />
+<text  x="1129.81" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="154.6" y="1973" width="1.2" height="15.0" fill="rgb(232,87,51)" rx="2" ry="2" />
+<text  x="157.61" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1180.3" y="2021" width="1.2" height="15.0" fill="rgb(247,110,8)" rx="2" ry="2" />
+<text  x="1183.28" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_lookup_symbol_x (1 times, 0.10%)</title><rect x="458.4" y="2005" width="1.2" height="15.0" fill="rgb(250,103,3)" rx="2" ry="2" />
+<text  x="461.42" y="2015.5" ></text>
+</g>
+<g >
+<title>dispose_words (2 times, 0.21%)</title><rect x="57.4" y="2037" width="2.4" height="15.0" fill="rgb(249,78,35)" rx="2" ry="2" />
+<text  x="60.39" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="78.1" y="1989" width="1.2" height="15.0" fill="rgb(208,219,35)" rx="2" ry="2" />
+<text  x="81.05" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="52.5" y="1973" width="1.2" height="15.0" fill="rgb(247,208,49)" rx="2" ry="2" />
+<text  x="55.53" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="492.5" y="1989" width="4.8" height="15.0" fill="rgb(249,8,45)" rx="2" ry="2" />
+<text  x="495.45" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1104.9" y="2021" width="1.2" height="15.0" fill="rgb(240,214,25)" rx="2" ry="2" />
+<text  x="1107.93" y="2031.5" ></text>
+</g>
+<g >
+<title>Perl_av_extend (1 times, 0.10%)</title><rect x="131.5" y="2037" width="1.2" height="15.0" fill="rgb(214,59,31)" rx="2" ry="2" />
+<text  x="134.52" y="2047.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (8 times, 0.82%)</title><rect x="1064.8" y="1973" width="9.8" height="15.0" fill="rgb(232,168,46)" rx="2" ry="2" />
+<text  x="1067.83" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="137.6" y="1989" width="1.2" height="15.0" fill="rgb(225,207,39)" rx="2" ry="2" />
+<text  x="140.60" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1152.3" y="2005" width="1.2" height="15.0" fill="rgb(249,133,54)" rx="2" ry="2" />
+<text  x="1155.33" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1124.4" y="1941" width="1.2" height="15.0" fill="rgb(224,192,45)" rx="2" ry="2" />
+<text  x="1127.38" y="1951.5" ></text>
+</g>
+<g >
+<title>__init_misc (1 times, 0.10%)</title><rect x="1147.5" y="2053" width="1.2" height="15.0" fill="rgb(247,157,18)" rx="2" ry="2" />
+<text  x="1150.47" y="2063.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (8 times, 0.82%)</title><rect x="1064.8" y="1957" width="9.8" height="15.0" fill="rgb(248,5,37)" rx="2" ry="2" />
+<text  x="1067.83" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1106.1" y="1973" width="2.5" height="15.0" fill="rgb(249,229,9)" rx="2" ry="2" />
+<text  x="1109.15" y="1983.5" ></text>
+</g>
+<g >
+<title>_nl_find_locale (1 times, 0.10%)</title><rect x="160.7" y="1973" width="1.2" height="15.0" fill="rgb(210,203,1)" rx="2" ry="2" />
+<text  x="163.69" y="1983.5" ></text>
+</g>
+<g >
+<title>dispose_word (1 times, 0.10%)</title><rect x="20.9" y="1973" width="1.3" height="15.0" fill="rgb(209,174,7)" rx="2" ry="2" />
+<text  x="23.94" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1183.9" y="2021" width="1.2" height="15.0" fill="rgb(239,198,15)" rx="2" ry="2" />
+<text  x="1186.92" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="757" width="1.2" height="15.0" fill="rgb(254,142,17)" rx="2" ry="2" />
+<text  x="20.29" y="767.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="136.4" y="2005" width="1.2" height="15.0" fill="rgb(205,120,38)" rx="2" ry="2" />
+<text  x="139.39" y="2015.5" ></text>
+</g>
+<g >
+<title>internal_fnwmatch (2 times, 0.21%)</title><rect x="1112.2" y="2037" width="2.5" height="15.0" fill="rgb(210,220,40)" rx="2" ry="2" />
+<text  x="1115.22" y="2047.5" ></text>
+</g>
+<g >
+<title>Perl_init_constants (1 times, 0.10%)</title><rect x="112.1" y="2053" width="1.2" height="15.0" fill="rgb(236,34,51)" rx="2" ry="2" />
+<text  x="115.08" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="231.2" y="2005" width="2.4" height="15.0" fill="rgb(217,153,17)" rx="2" ry="2" />
+<text  x="234.17" y="2015.5" ></text>
+</g>
+<g >
+<title>discard_unwind_frame (1 times, 0.10%)</title><rect x="52.5" y="2005" width="1.2" height="15.0" fill="rgb(251,158,38)" rx="2" ry="2" />
+<text  x="55.53" y="2015.5" ></text>
+</g>
+<g >
+<title>internal_fnwmatch (3 times, 0.31%)</title><rect x="1108.6" y="2037" width="3.6" height="15.0" fill="rgb(249,99,51)" rx="2" ry="2" />
+<text  x="1111.58" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1104.9" y="2037" width="1.2" height="15.0" fill="rgb(243,17,6)" rx="2" ry="2" />
+<text  x="1107.93" y="2047.5" ></text>
+</g>
+<g >
+<title>ptmalloc_init.part.0 (1 times, 0.10%)</title><rect x="1183.9" y="2053" width="1.2" height="15.0" fill="rgb(240,95,49)" rx="2" ry="2" />
+<text  x="1186.92" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1185.1" y="1973" width="1.3" height="15.0" fill="rgb(250,14,45)" rx="2" ry="2" />
+<text  x="1188.14" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="191.1" y="1957" width="1.2" height="15.0" fill="rgb(216,119,24)" rx="2" ry="2" />
+<text  x="194.07" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="197" width="1.2" height="15.0" fill="rgb(220,174,53)" rx="2" ry="2" />
+<text  x="20.29" y="207.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1075.8" y="1765" width="1.2" height="15.0" fill="rgb(251,75,49)" rx="2" ry="2" />
+<text  x="1078.77" y="1775.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="164.3" y="1989" width="1.3" height="15.0" fill="rgb(241,1,31)" rx="2" ry="2" />
+<text  x="167.34" y="1999.5" ></text>
+</g>
+<g >
+<title>__pthread_initialize_minimal_internal (1 times, 0.10%)</title><rect x="514.3" y="2053" width="1.2" height="15.0" fill="rgb(237,200,53)" rx="2" ry="2" />
+<text  x="517.33" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="48.9" y="1989" width="1.2" height="15.0" fill="rgb(225,162,49)" rx="2" ry="2" />
+<text  x="51.89" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1253" width="1.2" height="15.0" fill="rgb(225,156,44)" rx="2" ry="2" />
+<text  x="20.29" y="1263.5" ></text>
+</g>
+<g >
+<title>__cos_ifunc (1 times, 0.10%)</title><rect x="448.7" y="2005" width="1.2" height="15.0" fill="rgb(228,47,47)" rx="2" ry="2" />
+<text  x="451.70" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="75.6" y="2005" width="1.2" height="15.0" fill="rgb(206,145,2)" rx="2" ry="2" />
+<text  x="78.62" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1151.1" y="2005" width="1.2" height="15.0" fill="rgb(247,187,32)" rx="2" ry="2" />
+<text  x="1154.11" y="2015.5" ></text>
+</g>
+<g >
+<title>_int_malloc (1 times, 0.10%)</title><rect x="1096.4" y="2053" width="1.2" height="15.0" fill="rgb(205,79,47)" rx="2" ry="2" />
+<text  x="1099.43" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1381" width="1.2" height="15.0" fill="rgb(229,179,22)" rx="2" ry="2" />
+<text  x="20.29" y="1391.5" ></text>
+</g>
+<g >
+<title>Perl_regexec_flags (1 times, 0.10%)</title><rect x="159.5" y="2005" width="1.2" height="15.0" fill="rgb(240,48,40)" rx="2" ry="2" />
+<text  x="162.47" y="2015.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1095.2" y="1845" width="1.2" height="15.0" fill="rgb(207,15,39)" rx="2" ry="2" />
+<text  x="1098.21" y="1855.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="116.9" y="2037" width="1.3" height="15.0" fill="rgb(206,113,5)" rx="2" ry="2" />
+<text  x="119.94" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="245" width="1.2" height="15.0" fill="rgb(219,86,47)" rx="2" ry="2" />
+<text  x="20.29" y="255.5" ></text>
+</g>
+<g >
+<title>page_fault (8 times, 0.82%)</title><rect x="1064.8" y="1893" width="9.8" height="15.0" fill="rgb(213,129,42)" rx="2" ry="2" />
+<text  x="1067.83" y="1903.5" ></text>
+</g>
+<g >
+<title>__GI___towupper (1 times, 0.10%)</title><rect x="165.6" y="2005" width="1.2" height="15.0" fill="rgb(222,66,45)" rx="2" ry="2" />
+<text  x="168.55" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="997" width="1.2" height="15.0" fill="rgb(232,106,39)" rx="2" ry="2" />
+<text  x="20.29" y="1007.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1114.7" y="2037" width="1.2" height="15.0" fill="rgb(253,199,46)" rx="2" ry="2" />
+<text  x="1117.65" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="70.8" y="1989" width="1.2" height="15.0" fill="rgb(254,159,51)" rx="2" ry="2" />
+<text  x="73.76" y="1999.5" ></text>
+</g>
+<g >
+<title>Perl__invlist_union_maybe_complement_2nd (1 times, 0.10%)</title><rect x="143.7" y="2005" width="1.2" height="15.0" fill="rgb(216,171,33)" rx="2" ry="2" />
+<text  x="146.68" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="229" width="1.2" height="15.0" fill="rgb(252,185,1)" rx="2" ry="2" />
+<text  x="20.29" y="239.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="161.9" y="1989" width="2.4" height="15.0" fill="rgb(239,218,22)" rx="2" ry="2" />
+<text  x="164.91" y="1999.5" ></text>
+</g>
+<g >
+<title>hash_search (6 times, 0.62%)</title><rect x="91.4" y="2053" width="7.3" height="15.0" fill="rgb(242,96,21)" rx="2" ry="2" />
+<text  x="94.42" y="2063.5" ></text>
+</g>
+<g >
+<title>[perf-33916.map] (16 times, 1.65%)</title><rect x="1075.8" y="1909" width="19.4" height="15.0" fill="rgb(238,13,30)" rx="2" ry="2" />
+<text  x="1078.77" y="1919.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="509.5" y="2037" width="1.2" height="15.0" fill="rgb(224,119,22)" rx="2" ry="2" />
+<text  x="512.46" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="533" width="1.2" height="15.0" fill="rgb(252,49,0)" rx="2" ry="2" />
+<text  x="20.29" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="373" width="1.2" height="15.0" fill="rgb(244,129,2)" rx="2" ry="2" />
+<text  x="20.29" y="383.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="72.0" y="2021" width="1.2" height="15.0" fill="rgb(229,196,54)" rx="2" ry="2" />
+<text  x="74.98" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="520.4" y="2005" width="1.2" height="15.0" fill="rgb(238,224,39)" rx="2" ry="2" />
+<text  x="523.40" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="84.1" y="2005" width="1.2" height="15.0" fill="rgb(231,179,26)" rx="2" ry="2" />
+<text  x="87.13" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1098.9" y="1925" width="1.2" height="15.0" fill="rgb(237,211,32)" rx="2" ry="2" />
+<text  x="1101.86" y="1935.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1117.1" y="2021" width="1.2" height="15.0" fill="rgb(235,140,0)" rx="2" ry="2" />
+<text  x="1120.09" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="459.6" y="1973" width="1.3" height="15.0" fill="rgb(217,47,50)" rx="2" ry="2" />
+<text  x="462.64" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1669" width="1.2" height="15.0" fill="rgb(206,32,13)" rx="2" ry="2" />
+<text  x="20.29" y="1679.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="457.2" y="1973" width="1.2" height="15.0" fill="rgb(222,141,47)" rx="2" ry="2" />
+<text  x="460.21" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1187.6" y="2021" width="1.2" height="15.0" fill="rgb(235,118,21)" rx="2" ry="2" />
+<text  x="1190.57" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1109" width="1.2" height="15.0" fill="rgb(213,112,18)" rx="2" ry="2" />
+<text  x="20.29" y="1119.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (18 times, 1.85%)</title><rect x="1074.6" y="1989" width="21.8" height="15.0" fill="rgb(241,181,0)" rx="2" ry="2" />
+<text  x="1077.55" y="1999.5" >[..</text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="533.8" y="1989" width="6.0" height="15.0" fill="rgb(210,68,15)" rx="2" ry="2" />
+<text  x="536.77" y="1999.5" ></text>
+</g>
+<g >
+<title>memmove (1 times, 0.10%)</title><rect x="1131.7" y="2005" width="1.2" height="15.0" fill="rgb(227,37,5)" rx="2" ry="2" />
+<text  x="1134.67" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="458.4" y="1957" width="1.2" height="15.0" fill="rgb(208,144,36)" rx="2" ry="2" />
+<text  x="461.42" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="485" width="1.2" height="15.0" fill="rgb(231,32,48)" rx="2" ry="2" />
+<text  x="20.29" y="495.5" ></text>
+</g>
+<g >
+<title>dl_main (41 times, 4.22%)</title><rect x="448.7" y="2021" width="49.8" height="15.0" fill="rgb(231,85,16)" rx="2" ry="2" />
+<text  x="451.70" y="2031.5" >dl_main</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="74.4" y="2005" width="1.2" height="15.0" fill="rgb(249,66,43)" rx="2" ry="2" />
+<text  x="77.41" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="442.6" y="2005" width="1.2" height="15.0" fill="rgb(229,43,7)" rx="2" ry="2" />
+<text  x="445.63" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1145.0" y="2005" width="1.3" height="15.0" fill="rgb(226,32,30)" rx="2" ry="2" />
+<text  x="1148.04" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1106.1" y="2005" width="2.5" height="15.0" fill="rgb(250,81,2)" rx="2" ry="2" />
+<text  x="1109.15" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="59.8" y="2005" width="1.2" height="15.0" fill="rgb(234,80,3)" rx="2" ry="2" />
+<text  x="62.82" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="454.8" y="1989" width="1.2" height="15.0" fill="rgb(235,148,11)" rx="2" ry="2" />
+<text  x="457.78" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="132.7" y="2005" width="1.3" height="15.0" fill="rgb(228,2,40)" rx="2" ry="2" />
+<text  x="135.74" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1179.1" y="2021" width="1.2" height="15.0" fill="rgb(235,51,43)" rx="2" ry="2" />
+<text  x="1182.06" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1145.0" y="2037" width="1.3" height="15.0" fill="rgb(238,161,1)" rx="2" ry="2" />
+<text  x="1148.04" y="2047.5" ></text>
+</g>
+<g >
+<title>__pthread_tunables_init (1 times, 0.10%)</title><rect x="441.4" y="2037" width="1.2" height="15.0" fill="rgb(254,51,17)" rx="2" ry="2" />
+<text  x="444.41" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1137.7" y="1989" width="1.3" height="15.0" fill="rgb(234,220,39)" rx="2" ry="2" />
+<text  x="1140.74" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="22.2" y="2005" width="1.2" height="15.0" fill="rgb(223,48,50)" rx="2" ry="2" />
+<text  x="25.15" y="2015.5" ></text>
+</g>
+<g >
+<title>Perl_new_stackinfo (1 times, 0.10%)</title><rect x="135.2" y="2037" width="1.2" height="15.0" fill="rgb(244,180,6)" rx="2" ry="2" />
+<text  x="138.17" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="18.5" y="1925" width="1.2" height="15.0" fill="rgb(249,193,47)" rx="2" ry="2" />
+<text  x="21.51" y="1935.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1187.6" y="2005" width="1.2" height="15.0" fill="rgb(249,162,14)" rx="2" ry="2" />
+<text  x="1190.57" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="76.8" y="1989" width="1.3" height="15.0" fill="rgb(211,72,52)" rx="2" ry="2" />
+<text  x="79.84" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1131.7" y="1973" width="1.2" height="15.0" fill="rgb(235,118,40)" rx="2" ry="2" />
+<text  x="1134.67" y="1983.5" ></text>
+</g>
+<g >
+<title>dispose_fd_bitmap (3 times, 0.31%)</title><rect x="52.5" y="2037" width="3.7" height="15.0" fill="rgb(223,131,11)" rx="2" ry="2" />
+<text  x="55.53" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1493" width="1.2" height="15.0" fill="rgb(220,114,42)" rx="2" ry="2" />
+<text  x="20.29" y="1503.5" ></text>
+</g>
+<g >
+<title>__cxa_atexit (1 times, 0.10%)</title><rect x="1145.0" y="2053" width="1.3" height="15.0" fill="rgb(242,87,41)" rx="2" ry="2" />
+<text  x="1148.04" y="2063.5" ></text>
+</g>
+<g >
+<title>_int_malloc (2 times, 0.21%)</title><rect x="85.3" y="2053" width="2.5" height="15.0" fill="rgb(209,62,26)" rx="2" ry="2" />
+<text  x="88.35" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="965" width="1.2" height="15.0" fill="rgb(245,197,54)" rx="2" ry="2" />
+<text  x="20.29" y="975.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="101" width="1.2" height="15.0" fill="rgb(209,54,51)" rx="2" ry="2" />
+<text  x="20.29" y="111.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="445.1" y="2005" width="1.2" height="15.0" fill="rgb(252,109,5)" rx="2" ry="2" />
+<text  x="448.06" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="1095.2" y="1909" width="1.2" height="15.0" fill="rgb(216,165,46)" rx="2" ry="2" />
+<text  x="1098.21" y="1919.5" ></text>
+</g>
+<g >
+<title>_IO_file_sync@@GLIBC_2.2.5 (1 times, 0.10%)</title><rect x="27.0" y="2037" width="1.2" height="15.0" fill="rgb(215,155,45)" rx="2" ry="2" />
+<text  x="30.01" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="24.6" y="1989" width="1.2" height="15.0" fill="rgb(238,149,50)" rx="2" ry="2" />
+<text  x="27.58" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1188.8" y="2037" width="1.2" height="15.0" fill="rgb(243,129,12)" rx="2" ry="2" />
+<text  x="1191.78" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="490.0" y="1957" width="2.5" height="15.0" fill="rgb(238,139,27)" rx="2" ry="2" />
+<text  x="493.02" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="13.6" y="1989" width="3.7" height="15.0" fill="rgb(233,61,22)" rx="2" ry="2" />
+<text  x="16.65" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="452.3" y="1989" width="1.3" height="15.0" fill="rgb(242,186,8)" rx="2" ry="2" />
+<text  x="455.35" y="1999.5" ></text>
+</g>
+<g >
+<title>cmd_record (6 times, 0.62%)</title><rect x="1097.6" y="2005" width="7.3" height="15.0" fill="rgb(227,15,46)" rx="2" ry="2" />
+<text  x="1100.64" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (14 times, 1.44%)</title><rect x="233.6" y="2021" width="17.0" height="15.0" fill="rgb(215,173,20)" rx="2" ry="2" />
+<text  x="236.60" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1147.5" y="2037" width="1.2" height="15.0" fill="rgb(226,27,42)" rx="2" ry="2" />
+<text  x="1150.47" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="507.0" y="2005" width="1.2" height="15.0" fill="rgb(229,23,18)" rx="2" ry="2" />
+<text  x="510.03" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="511.9" y="2021" width="1.2" height="15.0" fill="rgb(243,160,3)" rx="2" ry="2" />
+<text  x="514.89" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1893" width="1.2" height="15.0" fill="rgb(250,42,36)" rx="2" ry="2" />
+<text  x="20.29" y="1903.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="79.3" y="2037" width="1.2" height="15.0" fill="rgb(227,202,3)" rx="2" ry="2" />
+<text  x="82.27" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1701" width="1.2" height="15.0" fill="rgb(236,213,22)" rx="2" ry="2" />
+<text  x="20.29" y="1711.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1146.3" y="2005" width="1.2" height="15.0" fill="rgb(243,103,14)" rx="2" ry="2" />
+<text  x="1149.25" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="549.6" y="2021" width="6.0" height="15.0" fill="rgb(226,141,33)" rx="2" ry="2" />
+<text  x="552.57" y="2031.5" ></text>
+</g>
+<g >
+<title>main (6 times, 0.62%)</title><rect x="1097.6" y="2037" width="7.3" height="15.0" fill="rgb(217,107,39)" rx="2" ry="2" />
+<text  x="1100.64" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="137.6" y="2005" width="1.2" height="15.0" fill="rgb(205,178,30)" rx="2" ry="2" />
+<text  x="140.60" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1131.7" y="1989" width="1.2" height="15.0" fill="rgb(231,213,49)" rx="2" ry="2" />
+<text  x="1134.67" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="53.7" y="1973" width="1.3" height="15.0" fill="rgb(228,219,27)" rx="2" ry="2" />
+<text  x="56.75" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1349" width="1.2" height="15.0" fill="rgb(230,97,29)" rx="2" ry="2" />
+<text  x="20.29" y="1359.5" ></text>
+</g>
+<g >
+<title>_dl_process_pt_note (1 times, 0.10%)</title><rect x="1152.3" y="2021" width="1.2" height="15.0" fill="rgb(247,80,47)" rx="2" ry="2" />
+<text  x="1155.33" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1148.7" y="2037" width="1.2" height="15.0" fill="rgb(224,96,20)" rx="2" ry="2" />
+<text  x="1151.68" y="2047.5" ></text>
+</g>
+<g >
+<title>_dl_start_user (3 times, 0.31%)</title><rect x="545.9" y="2053" width="3.7" height="15.0" fill="rgb(223,28,24)" rx="2" ry="2" />
+<text  x="548.92" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1040.5" y="2021" width="1.2" height="15.0" fill="rgb(221,152,10)" rx="2" ry="2" />
+<text  x="1043.53" y="2031.5" ></text>
+</g>
+<g >
+<title>flamegraph.pl (790 times, 81.36%)</title><rect x="104.8" y="2069" width="960.0" height="15.0" fill="rgb(247,23,13)" rx="2" ry="2" />
+<text  x="107.79" y="2079.5" >flamegraph.pl</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="78.1" y="2005" width="1.2" height="15.0" fill="rgb(241,65,23)" rx="2" ry="2" />
+<text  x="81.05" y="2015.5" ></text>
+</g>
+<g >
+<title>bashline_reset (1 times, 0.10%)</title><rect x="18.5" y="1957" width="1.2" height="15.0" fill="rgb(240,43,48)" rx="2" ry="2" />
+<text  x="21.51" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1142.6" y="2021" width="1.2" height="15.0" fill="rgb(219,214,9)" rx="2" ry="2" />
+<text  x="1145.61" y="2031.5" ></text>
+</g>
+<g >
+<title>__sysconf (1 times, 0.10%)</title><rect x="1185.1" y="2021" width="1.3" height="15.0" fill="rgb(223,191,25)" rx="2" ry="2" />
+<text  x="1188.14" y="2031.5" ></text>
+</g>
+<g >
+<title>Perl_utf8_length (1 times, 0.10%)</title><rect x="136.4" y="2037" width="1.2" height="15.0" fill="rgb(246,229,7)" rx="2" ry="2" />
+<text  x="139.39" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1148.7" y="2005" width="1.2" height="15.0" fill="rgb(247,130,40)" rx="2" ry="2" />
+<text  x="1151.68" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="456.0" y="1989" width="1.2" height="15.0" fill="rgb(252,25,12)" rx="2" ry="2" />
+<text  x="458.99" y="1999.5" ></text>
+</g>
+<g >
+<title>discard_unwind_frame (1 times, 0.10%)</title><rect x="53.7" y="1989" width="1.3" height="15.0" fill="rgb(211,94,29)" rx="2" ry="2" />
+<text  x="56.75" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1095.2" y="1797" width="1.2" height="15.0" fill="rgb(219,86,16)" rx="2" ry="2" />
+<text  x="1098.21" y="1807.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="508.2" y="2037" width="1.3" height="15.0" fill="rgb(241,7,28)" rx="2" ry="2" />
+<text  x="511.25" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="497.3" y="1989" width="1.2" height="15.0" fill="rgb(245,1,20)" rx="2" ry="2" />
+<text  x="500.31" y="1999.5" ></text>
+</g>
+<g >
+<title>_nl_find_locale (3 times, 0.31%)</title><rect x="1185.1" y="2037" width="3.7" height="15.0" fill="rgb(250,64,50)" rx="2" ry="2" />
+<text  x="1188.14" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1121.9" y="1973" width="1.3" height="15.0" fill="rgb(232,201,8)" rx="2" ry="2" />
+<text  x="1124.95" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (6 times, 0.62%)</title><rect x="91.4" y="2005" width="7.3" height="15.0" fill="rgb(244,121,53)" rx="2" ry="2" />
+<text  x="94.42" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1141.4" y="2005" width="1.2" height="15.0" fill="rgb(208,144,34)" rx="2" ry="2" />
+<text  x="1144.39" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1115.9" y="2021" width="1.2" height="15.0" fill="rgb(244,36,12)" rx="2" ry="2" />
+<text  x="1118.87" y="2031.5" ></text>
+</g>
+<g >
+<title>__strncmp_sse2 (1 times, 0.10%)</title><rect x="1104.9" y="2053" width="1.2" height="15.0" fill="rgb(227,137,20)" rx="2" ry="2" />
+<text  x="1107.93" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="121.8" y="2021" width="1.2" height="15.0" fill="rgb(219,135,15)" rx="2" ry="2" />
+<text  x="124.80" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1301" width="1.2" height="15.0" fill="rgb(238,15,4)" rx="2" ry="2" />
+<text  x="20.29" y="1311.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1074.6" y="1925" width="1.2" height="15.0" fill="rgb(244,31,47)" rx="2" ry="2" />
+<text  x="1077.55" y="1935.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="459.6" y="1989" width="1.3" height="15.0" fill="rgb(225,216,45)" rx="2" ry="2" />
+<text  x="462.64" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1038.1" y="2037" width="2.4" height="15.0" fill="rgb(214,154,54)" rx="2" ry="2" />
+<text  x="1041.09" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="497.3" y="1957" width="1.2" height="15.0" fill="rgb(222,192,46)" rx="2" ry="2" />
+<text  x="500.31" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (6 times, 0.62%)</title><rect x="91.4" y="2037" width="7.3" height="15.0" fill="rgb(220,166,4)" rx="2" ry="2" />
+<text  x="94.42" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (73 times, 7.52%)</title><rect x="140.0" y="2037" width="88.7" height="15.0" fill="rgb(205,11,43)" rx="2" ry="2" />
+<text  x="143.03" y="2047.5" >[unknown]</text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="104.8" y="2021" width="6.1" height="15.0" fill="rgb(214,146,12)" rx="2" ry="2" />
+<text  x="107.79" y="2031.5" ></text>
+</g>
+<g >
+<title>__getrlimit (1 times, 0.10%)</title><rect x="230.0" y="2037" width="1.2" height="15.0" fill="rgb(224,70,22)" rx="2" ry="2" />
+<text  x="232.96" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="70.8" y="2005" width="1.2" height="15.0" fill="rgb(224,64,29)" rx="2" ry="2" />
+<text  x="73.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1797" width="1.2" height="15.0" fill="rgb(233,99,31)" rx="2" ry="2" />
+<text  x="20.29" y="1807.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="143.7" y="1973" width="1.2" height="15.0" fill="rgb(215,169,13)" rx="2" ry="2" />
+<text  x="146.68" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="48.9" y="2005" width="1.2" height="15.0" fill="rgb(249,51,38)" rx="2" ry="2" />
+<text  x="51.89" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1165.7" y="2021" width="2.4" height="15.0" fill="rgb(211,116,4)" rx="2" ry="2" />
+<text  x="1168.70" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="140.0" y="1989" width="1.2" height="15.0" fill="rgb(221,183,26)" rx="2" ry="2" />
+<text  x="143.03" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1181.5" y="2037" width="1.2" height="15.0" fill="rgb(221,227,24)" rx="2" ry="2" />
+<text  x="1184.49" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1151.1" y="1989" width="1.2" height="15.0" fill="rgb(212,168,0)" rx="2" ry="2" />
+<text  x="1154.11" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="75.6" y="1989" width="1.2" height="15.0" fill="rgb(219,39,3)" rx="2" ry="2" />
+<text  x="78.62" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="488.8" y="1973" width="1.2" height="15.0" fill="rgb(213,153,12)" rx="2" ry="2" />
+<text  x="491.81" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1685" width="1.2" height="15.0" fill="rgb(223,174,14)" rx="2" ry="2" />
+<text  x="20.29" y="1695.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1183.9" y="2037" width="1.2" height="15.0" fill="rgb(247,87,7)" rx="2" ry="2" />
+<text  x="1186.92" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="79.3" y="2005" width="1.2" height="15.0" fill="rgb(242,126,12)" rx="2" ry="2" />
+<text  x="82.27" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (4 times, 0.41%)</title><rect x="492.5" y="2005" width="4.8" height="15.0" fill="rgb(241,227,3)" rx="2" ry="2" />
+<text  x="495.45" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="443.8" y="2021" width="1.3" height="15.0" fill="rgb(209,131,2)" rx="2" ry="2" />
+<text  x="446.84" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="136.4" y="1989" width="1.2" height="15.0" fill="rgb(228,191,21)" rx="2" ry="2" />
+<text  x="139.39" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 times, 0.21%)</title><rect x="52.5" y="2021" width="2.5" height="15.0" fill="rgb(251,199,24)" rx="2" ry="2" />
+<text  x="55.53" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="181" width="1.2" height="15.0" fill="rgb(217,111,15)" rx="2" ry="2" />
+<text  x="20.29" y="191.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (18 times, 1.85%)</title><rect x="1074.6" y="1973" width="21.8" height="15.0" fill="rgb(248,51,29)" rx="2" ry="2" />
+<text  x="1077.55" y="1983.5" >[..</text>
+</g>
+<g >
+<title>__strcmp_sse2 (1 times, 0.10%)</title><rect x="1148.7" y="2053" width="1.2" height="15.0" fill="rgb(210,18,16)" rx="2" ry="2" />
+<text  x="1151.68" y="2063.5" ></text>
+</g>
+<g >
+<title>[bash] (3 times, 0.31%)</title><rect x="10.0" y="2053" width="3.6" height="15.0" fill="rgb(242,33,53)" rx="2" ry="2" />
+<text  x="13.00" y="2063.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (20 times, 2.06%)</title><rect x="166.8" y="2005" width="24.3" height="15.0" fill="rgb(210,215,50)" rx="2" ry="2" />
+<text  x="169.77" y="2015.5" >_..</text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="231.2" y="1989" width="2.4" height="15.0" fill="rgb(242,78,18)" rx="2" ry="2" />
+<text  x="234.17" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="142.5" y="1957" width="1.2" height="15.0" fill="rgb(220,211,48)" rx="2" ry="2" />
+<text  x="145.46" y="1967.5" ></text>
+</g>
+<g >
+<title>_dl_allocate_tls_storage (1 times, 0.10%)</title><rect x="443.8" y="2037" width="1.3" height="15.0" fill="rgb(220,119,41)" rx="2" ry="2" />
+<text  x="446.84" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (23 times, 2.37%)</title><rect x="460.9" y="1957" width="27.9" height="15.0" fill="rgb(253,44,46)" rx="2" ry="2" />
+<text  x="463.85" y="1967.5" >d..</text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="10.0" y="2021" width="3.6" height="15.0" fill="rgb(242,83,2)" rx="2" ry="2" />
+<text  x="13.00" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="442.6" y="1989" width="1.2" height="15.0" fill="rgb(251,204,45)" rx="2" ry="2" />
+<text  x="445.63" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="87.8" y="2037" width="1.2" height="15.0" fill="rgb(238,229,6)" rx="2" ry="2" />
+<text  x="90.78" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (387 times, 39.86%)</title><rect x="555.6" y="2005" width="470.3" height="15.0" fill="rgb(253,70,43)" rx="2" ry="2" />
+<text  x="558.64" y="2015.5" >do_page_fault</text>
+</g>
+<g >
+<title>Perl_pp_not (1 times, 0.10%)</title><rect x="114.5" y="2053" width="1.2" height="15.0" fill="rgb(215,17,27)" rx="2" ry="2" />
+<text  x="117.51" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="74.4" y="1989" width="1.2" height="15.0" fill="rgb(205,218,54)" rx="2" ry="2" />
+<text  x="77.41" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="645" width="1.2" height="15.0" fill="rgb(205,46,16)" rx="2" ry="2" />
+<text  x="20.29" y="655.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="515.5" y="2021" width="1.3" height="15.0" fill="rgb(248,37,26)" rx="2" ry="2" />
+<text  x="518.54" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1112.2" y="2021" width="2.5" height="15.0" fill="rgb(247,93,17)" rx="2" ry="2" />
+<text  x="1115.22" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1909" width="1.2" height="15.0" fill="rgb(209,195,41)" rx="2" ry="2" />
+<text  x="20.29" y="1919.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="442.6" y="2021" width="1.2" height="15.0" fill="rgb(214,47,17)" rx="2" ry="2" />
+<text  x="445.63" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1114.7" y="2005" width="1.2" height="15.0" fill="rgb(227,107,27)" rx="2" ry="2" />
+<text  x="1117.65" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1125.6" y="1957" width="1.2" height="15.0" fill="rgb(250,225,31)" rx="2" ry="2" />
+<text  x="1128.59" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="533.8" y="2005" width="6.0" height="15.0" fill="rgb(238,189,40)" rx="2" ry="2" />
+<text  x="536.77" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="519.2" y="2037" width="1.2" height="15.0" fill="rgb(206,85,2)" rx="2" ry="2" />
+<text  x="522.19" y="2047.5" ></text>
+</g>
+<g >
+<title>[libgjs.so.0.0.0] (8 times, 0.82%)</title><rect x="1064.8" y="2021" width="9.8" height="15.0" fill="rgb(239,22,32)" rx="2" ry="2" />
+<text  x="1067.83" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (7 times, 0.72%)</title><rect x="62.3" y="2021" width="8.5" height="15.0" fill="rgb(205,55,6)" rx="2" ry="2" />
+<text  x="65.26" y="2031.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1095.2" y="1861" width="1.2" height="15.0" fill="rgb(229,128,8)" rx="2" ry="2" />
+<text  x="1098.21" y="1871.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="120.6" y="2005" width="1.2" height="15.0" fill="rgb(229,148,29)" rx="2" ry="2" />
+<text  x="123.59" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="55.0" y="1973" width="1.2" height="15.0" fill="rgb(221,30,27)" rx="2" ry="2" />
+<text  x="57.96" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="520.4" y="1989" width="1.2" height="15.0" fill="rgb(251,10,48)" rx="2" ry="2" />
+<text  x="523.40" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (157 times, 16.17%)</title><rect x="250.6" y="2021" width="190.8" height="15.0" fill="rgb(252,150,40)" rx="2" ry="2" />
+<text  x="253.62" y="2031.5" >page_fault</text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="114.5" y="2037" width="1.2" height="15.0" fill="rgb(253,227,39)" rx="2" ry="2" />
+<text  x="117.51" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="125.4" y="1973" width="6.1" height="15.0" fill="rgb(232,113,42)" rx="2" ry="2" />
+<text  x="128.45" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="192.3" y="1941" width="1.2" height="15.0" fill="rgb(217,60,19)" rx="2" ry="2" />
+<text  x="195.29" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="261" width="1.2" height="15.0" fill="rgb(231,74,42)" rx="2" ry="2" />
+<text  x="20.29" y="271.5" ></text>
+</g>
+<g >
+<title>do_page_fault (8 times, 0.82%)</title><rect x="1064.8" y="1877" width="9.8" height="15.0" fill="rgb(229,172,43)" rx="2" ry="2" />
+<text  x="1067.83" y="1887.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="193.5" y="1989" width="1.2" height="15.0" fill="rgb(233,133,36)" rx="2" ry="2" />
+<text  x="196.50" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="78.1" y="2021" width="1.2" height="15.0" fill="rgb(220,210,2)" rx="2" ry="2" />
+<text  x="81.05" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 times, 0.41%)</title><rect x="17.3" y="2005" width="4.9" height="15.0" fill="rgb(241,68,49)" rx="2" ry="2" />
+<text  x="20.29" y="2015.5" ></text>
+</g>
+<g >
+<title>__libc_fork (3 times, 0.31%)</title><rect x="80.5" y="2053" width="3.6" height="15.0" fill="rgb(218,33,25)" rx="2" ry="2" />
+<text  x="83.48" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="194.7" y="1957" width="1.2" height="15.0" fill="rgb(252,204,34)" rx="2" ry="2" />
+<text  x="197.72" y="1967.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (16 times, 1.65%)</title><rect x="1075.8" y="1877" width="19.4" height="15.0" fill="rgb(241,209,4)" rx="2" ry="2" />
+<text  x="1078.77" y="1887.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="452.3" y="1973" width="1.3" height="15.0" fill="rgb(226,168,21)" rx="2" ry="2" />
+<text  x="455.35" y="1983.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1095.2" y="1877" width="1.2" height="15.0" fill="rgb(245,62,43)" rx="2" ry="2" />
+<text  x="1098.21" y="1887.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1143.8" y="2037" width="1.2" height="15.0" fill="rgb(248,10,8)" rx="2" ry="2" />
+<text  x="1146.82" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="131.5" y="1989" width="1.2" height="15.0" fill="rgb(250,183,11)" rx="2" ry="2" />
+<text  x="134.52" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="120.6" y="2021" width="1.2" height="15.0" fill="rgb(209,175,20)" rx="2" ry="2" />
+<text  x="123.59" y="2031.5" ></text>
+</g>
+<g >
+<title>pool-org.gnome. (5 times, 0.51%)</title><rect x="1108.6" y="2069" width="6.1" height="15.0" fill="rgb(238,44,21)" rx="2" ry="2" />
+<text  x="1111.58" y="2079.5" ></text>
+</g>
+<g >
+<title>[libcrypt.so.1.1.0] (1 times, 0.10%)</title><rect x="121.8" y="2053" width="1.2" height="15.0" fill="rgb(210,46,41)" rx="2" ry="2" />
+<text  x="124.80" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1114.7" y="2021" width="1.2" height="15.0" fill="rgb(214,130,50)" rx="2" ry="2" />
+<text  x="1117.65" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1119.5" y="2005" width="1.2" height="15.0" fill="rgb(247,221,43)" rx="2" ry="2" />
+<text  x="1122.52" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="451.1" y="1989" width="1.2" height="15.0" fill="rgb(242,102,47)" rx="2" ry="2" />
+<text  x="454.13" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="515.5" y="2005" width="1.3" height="15.0" fill="rgb(206,39,25)" rx="2" ry="2" />
+<text  x="518.54" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (314 times, 32.34%)</title><rect x="125.4" y="2053" width="381.6" height="15.0" fill="rgb(253,211,43)" rx="2" ry="2" />
+<text  x="128.45" y="2063.5" >[unknown]</text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1102.5" y="1957" width="2.4" height="15.0" fill="rgb(207,99,6)" rx="2" ry="2" />
+<text  x="1105.50" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (387 times, 39.86%)</title><rect x="555.6" y="2021" width="470.3" height="15.0" fill="rgb(205,173,32)" rx="2" ry="2" />
+<text  x="558.64" y="2031.5" >do_page_fault</text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="143.7" y="1989" width="1.2" height="15.0" fill="rgb(221,160,22)" rx="2" ry="2" />
+<text  x="146.68" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="85.3" y="2037" width="2.5" height="15.0" fill="rgb(244,43,44)" rx="2" ry="2" />
+<text  x="88.35" y="2047.5" ></text>
+</g>
+<g >
+<title>[bash] (3 times, 0.31%)</title><rect x="13.6" y="2037" width="3.7" height="15.0" fill="rgb(210,95,41)" rx="2" ry="2" />
+<text  x="16.65" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1153.5" y="2005" width="2.5" height="15.0" fill="rgb(232,40,4)" rx="2" ry="2" />
+<text  x="1156.54" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1102.5" y="1925" width="2.4" height="15.0" fill="rgb(220,200,29)" rx="2" ry="2" />
+<text  x="1105.50" y="1935.5" ></text>
+</g>
+<g >
+<title>do_page_fault (20 times, 2.06%)</title><rect x="166.8" y="1957" width="24.3" height="15.0" fill="rgb(254,146,22)" rx="2" ry="2" />
+<text  x="169.77" y="1967.5" >d..</text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="10.0" y="2005" width="3.6" height="15.0" fill="rgb(219,27,12)" rx="2" ry="2" />
+<text  x="13.00" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="549" width="1.2" height="15.0" fill="rgb(219,99,25)" rx="2" ry="2" />
+<text  x="20.29" y="559.5" ></text>
+</g>
+<g >
+<title>do_page_fault (21 times, 2.16%)</title><rect x="203.2" y="1989" width="25.5" height="15.0" fill="rgb(242,12,31)" rx="2" ry="2" />
+<text  x="206.22" y="1999.5" >d..</text>
+</g>
+<g >
+<title>bash (78 times, 8.03%)</title><rect x="10.0" y="2069" width="94.8" height="15.0" fill="rgb(251,44,46)" rx="2" ry="2" />
+<text  x="13.00" y="2079.5" >bash</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="23.4" y="1989" width="1.2" height="15.0" fill="rgb(226,7,40)" rx="2" ry="2" />
+<text  x="26.37" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="821" width="1.2" height="15.0" fill="rgb(224,204,49)" rx="2" ry="2" />
+<text  x="20.29" y="831.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="79.3" y="2021" width="1.2" height="15.0" fill="rgb(218,118,26)" rx="2" ry="2" />
+<text  x="82.27" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="120.6" y="2037" width="1.2" height="15.0" fill="rgb(251,40,24)" rx="2" ry="2" />
+<text  x="123.59" y="2047.5" ></text>
+</g>
+<g >
+<title>malloc (4 times, 0.41%)</title><rect x="98.7" y="2053" width="4.9" height="15.0" fill="rgb(246,14,41)" rx="2" ry="2" />
+<text  x="101.71" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1653" width="1.2" height="15.0" fill="rgb(241,220,7)" rx="2" ry="2" />
+<text  x="20.29" y="1663.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="59.8" y="2021" width="1.2" height="15.0" fill="rgb(212,84,21)" rx="2" ry="2" />
+<text  x="62.82" y="2031.5" ></text>
+</g>
+<g >
+<title>__restore_rt (1 times, 0.10%)</title><rect x="1097.6" y="1973" width="1.3" height="15.0" fill="rgb(250,157,27)" rx="2" ry="2" />
+<text  x="1100.64" y="1983.5" ></text>
+</g>
+<g >
+<title>__brk (1 times, 0.10%)</title><rect x="228.7" y="2037" width="1.3" height="15.0" fill="rgb(247,131,23)" rx="2" ry="2" />
+<text  x="231.74" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1149.9" y="2037" width="1.2" height="15.0" fill="rgb(225,123,47)" rx="2" ry="2" />
+<text  x="1152.90" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1139.0" y="1989" width="2.4" height="15.0" fill="rgb(241,229,49)" rx="2" ry="2" />
+<text  x="1141.96" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="164.3" y="1957" width="1.3" height="15.0" fill="rgb(244,144,23)" rx="2" ry="2" />
+<text  x="167.34" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1156.0" y="1989" width="1.2" height="15.0" fill="rgb(208,139,29)" rx="2" ry="2" />
+<text  x="1158.97" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="61.0" y="2005" width="1.3" height="15.0" fill="rgb(250,72,31)" rx="2" ry="2" />
+<text  x="64.04" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (6 times, 0.62%)</title><rect x="1077.0" y="1797" width="7.3" height="15.0" fill="rgb(209,13,21)" rx="2" ry="2" />
+<text  x="1079.98" y="1807.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1165.7" y="2005" width="2.4" height="15.0" fill="rgb(238,44,19)" rx="2" ry="2" />
+<text  x="1168.70" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1101.3" y="1925" width="1.2" height="15.0" fill="rgb(246,144,7)" rx="2" ry="2" />
+<text  x="1104.29" y="1935.5" ></text>
+</g>
+<g >
+<title>memset (5 times, 0.51%)</title><rect x="539.8" y="2037" width="6.1" height="15.0" fill="rgb(216,142,32)" rx="2" ry="2" />
+<text  x="542.85" y="2047.5" ></text>
+</g>
+<g >
+<title>_dl_relocate_object (4 times, 0.41%)</title><rect x="1126.8" y="2005" width="4.9" height="15.0" fill="rgb(237,199,32)" rx="2" ry="2" />
+<text  x="1129.81" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 times, 0.21%)</title><rect x="1112.2" y="2053" width="2.5" height="15.0" fill="rgb(206,124,24)" rx="2" ry="2" />
+<text  x="1115.22" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1152.3" y="1973" width="1.2" height="15.0" fill="rgb(249,26,18)" rx="2" ry="2" />
+<text  x="1155.33" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="197.1" y="1957" width="6.1" height="15.0" fill="rgb(206,178,28)" rx="2" ry="2" />
+<text  x="200.15" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="451.1" y="1957" width="1.2" height="15.0" fill="rgb(223,76,19)" rx="2" ry="2" />
+<text  x="454.13" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="104.8" y="2005" width="6.1" height="15.0" fill="rgb(224,160,0)" rx="2" ry="2" />
+<text  x="107.79" y="2015.5" ></text>
+</g>
+<g >
+<title>Perl_yylex (1 times, 0.10%)</title><rect x="137.6" y="2037" width="1.2" height="15.0" fill="rgb(219,142,12)" rx="2" ry="2" />
+<text  x="140.60" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1541" width="1.2" height="15.0" fill="rgb(252,80,46)" rx="2" ry="2" />
+<text  x="20.29" y="1551.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="157.0" y="1957" width="1.3" height="15.0" fill="rgb(251,158,22)" rx="2" ry="2" />
+<text  x="160.04" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1118.3" y="1989" width="1.2" height="15.0" fill="rgb(206,30,18)" rx="2" ry="2" />
+<text  x="1121.30" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="193.5" y="1973" width="1.2" height="15.0" fill="rgb(238,23,32)" rx="2" ry="2" />
+<text  x="196.50" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (10 times, 1.03%)</title><rect x="521.6" y="1989" width="12.2" height="15.0" fill="rgb(221,23,17)" rx="2" ry="2" />
+<text  x="524.62" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (6 times, 0.62%)</title><rect x="91.4" y="2021" width="7.3" height="15.0" fill="rgb(250,210,12)" rx="2" ry="2" />
+<text  x="94.42" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1100.1" y="1941" width="1.2" height="15.0" fill="rgb(251,143,45)" rx="2" ry="2" />
+<text  x="1103.07" y="1951.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1180.3" y="2037" width="1.2" height="15.0" fill="rgb(225,84,11)" rx="2" ry="2" />
+<text  x="1183.28" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="121.8" y="2005" width="1.2" height="15.0" fill="rgb(229,221,30)" rx="2" ry="2" />
+<text  x="124.80" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="548.4" y="1989" width="1.2" height="15.0" fill="rgb(249,137,34)" rx="2" ry="2" />
+<text  x="551.35" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="510.7" y="2037" width="1.2" height="15.0" fill="rgb(205,146,11)" rx="2" ry="2" />
+<text  x="513.68" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="869" width="1.2" height="15.0" fill="rgb(239,217,31)" rx="2" ry="2" />
+<text  x="20.29" y="879.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="154.6" y="1989" width="1.2" height="15.0" fill="rgb(218,188,26)" rx="2" ry="2" />
+<text  x="157.61" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1040.5" y="2037" width="1.2" height="15.0" fill="rgb(253,198,6)" rx="2" ry="2" />
+<text  x="1043.53" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="501" width="1.2" height="15.0" fill="rgb(226,10,19)" rx="2" ry="2" />
+<text  x="20.29" y="511.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1158.4" y="1989" width="2.4" height="15.0" fill="rgb(239,216,7)" rx="2" ry="2" />
+<text  x="1161.40" y="1999.5" ></text>
+</g>
+<g >
+<title>Perl_yyparse (1 times, 0.10%)</title><rect x="138.8" y="2037" width="1.2" height="15.0" fill="rgb(229,192,28)" rx="2" ry="2" />
+<text  x="141.82" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1118.3" y="2021" width="1.2" height="15.0" fill="rgb(215,0,49)" rx="2" ry="2" />
+<text  x="1121.30" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_map_object_from_fd (10 times, 1.03%)</title><rect x="521.6" y="2037" width="12.2" height="15.0" fill="rgb(214,28,51)" rx="2" ry="2" />
+<text  x="524.62" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="165.6" y="1973" width="1.2" height="15.0" fill="rgb(241,146,20)" rx="2" ry="2" />
+<text  x="168.55" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1148.7" y="2021" width="1.2" height="15.0" fill="rgb(244,88,27)" rx="2" ry="2" />
+<text  x="1151.68" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="454.8" y="1957" width="1.2" height="15.0" fill="rgb(224,112,32)" rx="2" ry="2" />
+<text  x="457.78" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1877" width="1.2" height="15.0" fill="rgb(224,76,50)" rx="2" ry="2" />
+<text  x="20.29" y="1887.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="141.2" y="1989" width="1.3" height="15.0" fill="rgb(239,107,19)" rx="2" ry="2" />
+<text  x="144.25" y="1999.5" ></text>
+</g>
+<g >
+<title>[perf-33916.map] (17 times, 1.75%)</title><rect x="1075.8" y="1925" width="20.6" height="15.0" fill="rgb(241,74,0)" rx="2" ry="2" />
+<text  x="1078.77" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 times, 0.41%)</title><rect x="17.3" y="1989" width="4.9" height="15.0" fill="rgb(223,149,29)" rx="2" ry="2" />
+<text  x="20.29" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1040.5" y="2005" width="1.2" height="15.0" fill="rgb(210,88,41)" rx="2" ry="2" />
+<text  x="1043.53" y="2015.5" ></text>
+</g>
+<g >
+<title>_setjmp (1 times, 0.10%)</title><rect x="1179.1" y="2053" width="1.2" height="15.0" fill="rgb(241,53,22)" rx="2" ry="2" />
+<text  x="1182.06" y="2063.5" ></text>
+</g>
+<g >
+<title>rl_initialize (1 times, 0.10%)</title><rect x="70.8" y="2037" width="1.2" height="15.0" fill="rgb(253,14,16)" rx="2" ry="2" />
+<text  x="73.76" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1139.0" y="2021" width="2.4" height="15.0" fill="rgb(231,122,53)" rx="2" ry="2" />
+<text  x="1141.96" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="549.6" y="2005" width="6.0" height="15.0" fill="rgb(241,156,24)" rx="2" ry="2" />
+<text  x="552.57" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (3 times, 0.31%)</title><rect x="1108.6" y="2021" width="3.6" height="15.0" fill="rgb(218,94,54)" rx="2" ry="2" />
+<text  x="1111.58" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="445.1" y="2021" width="1.2" height="15.0" fill="rgb(246,118,35)" rx="2" ry="2" />
+<text  x="448.06" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="507.0" y="2021" width="1.2" height="15.0" fill="rgb(214,57,30)" rx="2" ry="2" />
+<text  x="510.03" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="511.9" y="2005" width="1.2" height="15.0" fill="rgb(222,82,15)" rx="2" ry="2" />
+<text  x="514.89" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="20.9" y="1957" width="1.3" height="15.0" fill="rgb(228,81,53)" rx="2" ry="2" />
+<text  x="23.94" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="24.6" y="2005" width="1.2" height="15.0" fill="rgb(240,173,38)" rx="2" ry="2" />
+<text  x="27.58" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1146.3" y="2021" width="1.2" height="15.0" fill="rgb(233,77,4)" rx="2" ry="2" />
+<text  x="1149.25" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_setup_hash (5 times, 0.51%)</title><rect x="533.8" y="2037" width="6.0" height="15.0" fill="rgb(241,44,36)" rx="2" ry="2" />
+<text  x="536.77" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="125.4" y="2005" width="6.1" height="15.0" fill="rgb(247,118,15)" rx="2" ry="2" />
+<text  x="128.45" y="2015.5" ></text>
+</g>
+<g >
+<title>Perl_PerlLIO_open3_cloexec (1 times, 0.10%)</title><rect x="141.2" y="2005" width="1.3" height="15.0" fill="rgb(251,131,49)" rx="2" ry="2" />
+<text  x="144.25" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="192.3" y="1973" width="1.2" height="15.0" fill="rgb(240,71,31)" rx="2" ry="2" />
+<text  x="195.29" y="1983.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1095.2" y="1829" width="1.2" height="15.0" fill="rgb(208,159,26)" rx="2" ry="2" />
+<text  x="1098.21" y="1839.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="103.6" y="2037" width="1.2" height="15.0" fill="rgb(238,225,28)" rx="2" ry="2" />
+<text  x="106.57" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="545.9" y="2005" width="2.5" height="15.0" fill="rgb(213,96,27)" rx="2" ry="2" />
+<text  x="548.92" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1445" width="1.2" height="15.0" fill="rgb(231,5,18)" rx="2" ry="2" />
+<text  x="20.29" y="1455.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1525" width="1.2" height="15.0" fill="rgb(229,41,2)" rx="2" ry="2" />
+<text  x="20.29" y="1535.5" ></text>
+</g>
+<g >
+<title>dispose_words (1 times, 0.10%)</title><rect x="53.7" y="2005" width="1.3" height="15.0" fill="rgb(210,38,29)" rx="2" ry="2" />
+<text  x="56.75" y="2015.5" ></text>
+</g>
+<g >
+<title>nautilus (1 times, 0.10%)</title><rect x="1096.4" y="2069" width="1.2" height="15.0" fill="rgb(231,44,45)" rx="2" ry="2" />
+<text  x="1099.43" y="2079.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="230.0" y="2021" width="1.2" height="15.0" fill="rgb(215,41,9)" rx="2" ry="2" />
+<text  x="232.96" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="514.3" y="2037" width="1.2" height="15.0" fill="rgb(241,195,11)" rx="2" ry="2" />
+<text  x="517.33" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="47.7" y="2005" width="1.2" height="15.0" fill="rgb(223,27,45)" rx="2" ry="2" />
+<text  x="50.67" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="158.3" y="1973" width="1.2" height="15.0" fill="rgb(238,126,31)" rx="2" ry="2" />
+<text  x="161.26" y="1983.5" ></text>
+</g>
+<g >
+<title>_nl_intern_locale_data (10 times, 1.03%)</title><rect x="1025.9" y="2053" width="12.2" height="15.0" fill="rgb(227,88,46)" rx="2" ry="2" />
+<text  x="1028.94" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1179.1" y="2005" width="1.2" height="15.0" fill="rgb(239,102,32)" rx="2" ry="2" />
+<text  x="1182.06" y="2015.5" ></text>
+</g>
+<g >
+<title>strcmp (1 times, 0.10%)</title><rect x="1040.5" y="2053" width="1.2" height="15.0" fill="rgb(246,38,25)" rx="2" ry="2" />
+<text  x="1043.53" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="123.0" y="2005" width="2.4" height="15.0" fill="rgb(235,134,14)" rx="2" ry="2" />
+<text  x="126.02" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1119.5" y="2021" width="1.2" height="15.0" fill="rgb(217,150,33)" rx="2" ry="2" />
+<text  x="1122.52" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1125" width="1.2" height="15.0" fill="rgb(214,80,54)" rx="2" ry="2" />
+<text  x="20.29" y="1135.5" ></text>
+</g>
+<g >
+<title>_dl_init_paths (1 times, 0.10%)</title><rect x="457.2" y="2005" width="1.2" height="15.0" fill="rgb(245,161,43)" rx="2" ry="2" />
+<text  x="460.21" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1573" width="1.2" height="15.0" fill="rgb(215,16,4)" rx="2" ry="2" />
+<text  x="20.29" y="1583.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (6 times, 0.62%)</title><rect x="1097.6" y="2053" width="7.3" height="15.0" fill="rgb(215,150,25)" rx="2" ry="2" />
+<text  x="1100.64" y="2063.5" ></text>
+</g>
+<g >
+<title>perl_construct (6 times, 0.62%)</title><rect x="195.9" y="2005" width="7.3" height="15.0" fill="rgb(237,107,53)" rx="2" ry="2" />
+<text  x="198.93" y="2015.5" ></text>
+</g>
+<g >
+<title>rl_reset_line_state (1 times, 0.10%)</title><rect x="72.0" y="2037" width="1.2" height="15.0" fill="rgb(227,51,7)" rx="2" ry="2" />
+<text  x="74.98" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="501.0" y="2021" width="6.0" height="15.0" fill="rgb(207,137,6)" rx="2" ry="2" />
+<text  x="503.96" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="508.2" y="2005" width="1.3" height="15.0" fill="rgb(222,71,10)" rx="2" ry="2" />
+<text  x="511.25" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="80.5" y="2005" width="3.6" height="15.0" fill="rgb(211,58,36)" rx="2" ry="2" />
+<text  x="83.48" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1179.1" y="2037" width="1.2" height="15.0" fill="rgb(245,185,37)" rx="2" ry="2" />
+<text  x="1182.06" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="325" width="1.2" height="15.0" fill="rgb(220,56,47)" rx="2" ry="2" />
+<text  x="20.29" y="335.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="511.9" y="2037" width="1.2" height="15.0" fill="rgb(213,90,23)" rx="2" ry="2" />
+<text  x="514.89" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="53.7" y="1957" width="1.3" height="15.0" fill="rgb(240,41,48)" rx="2" ry="2" />
+<text  x="56.75" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1131.7" y="1957" width="1.2" height="15.0" fill="rgb(247,123,47)" rx="2" ry="2" />
+<text  x="1134.67" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="441.4" y="2021" width="1.2" height="15.0" fill="rgb(225,33,19)" rx="2" ry="2" />
+<text  x="444.41" y="2031.5" ></text>
+</g>
+<g >
+<title>[libgio-2.0.so.0.6400.3] (3 times, 0.31%)</title><rect x="1108.6" y="2053" width="3.6" height="15.0" fill="rgb(240,33,31)" rx="2" ry="2" />
+<text  x="1111.58" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1124.4" y="1973" width="1.2" height="15.0" fill="rgb(241,92,23)" rx="2" ry="2" />
+<text  x="1127.38" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="116.9" y="2021" width="1.3" height="15.0" fill="rgb(206,216,11)" rx="2" ry="2" />
+<text  x="119.94" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="213" width="1.2" height="15.0" fill="rgb(234,124,51)" rx="2" ry="2" />
+<text  x="20.29" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1813" width="1.2" height="15.0" fill="rgb(245,32,50)" rx="2" ry="2" />
+<text  x="20.29" y="1823.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="138.8" y="1989" width="1.2" height="15.0" fill="rgb(212,79,48)" rx="2" ry="2" />
+<text  x="141.82" y="1999.5" ></text>
+</g>
+<g >
+<title>__libc_pthread_init (2 times, 0.21%)</title><rect x="231.2" y="2037" width="2.4" height="15.0" fill="rgb(210,129,38)" rx="2" ry="2" />
+<text  x="234.17" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="389" width="1.2" height="15.0" fill="rgb(226,102,27)" rx="2" ry="2" />
+<text  x="20.29" y="399.5" ></text>
+</g>
+<g >
+<title>Perl_setdefout (1 times, 0.10%)</title><rect x="116.9" y="2053" width="1.3" height="15.0" fill="rgb(205,5,42)" rx="2" ry="2" />
+<text  x="119.94" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (10 times, 1.03%)</title><rect x="1025.9" y="2037" width="12.2" height="15.0" fill="rgb(219,25,27)" rx="2" ry="2" />
+<text  x="1028.94" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1188.8" y="2005" width="1.2" height="15.0" fill="rgb(250,142,47)" rx="2" ry="2" />
+<text  x="1191.78" y="2015.5" ></text>
+</g>
+<g >
+<title>strchr (1 times, 0.10%)</title><rect x="1137.7" y="2005" width="1.3" height="15.0" fill="rgb(238,12,38)" rx="2" ry="2" />
+<text  x="1140.74" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="490.0" y="1973" width="2.5" height="15.0" fill="rgb(248,189,21)" rx="2" ry="2" />
+<text  x="493.02" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1124.4" y="1957" width="1.2" height="15.0" fill="rgb(229,25,2)" rx="2" ry="2" />
+<text  x="1127.38" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="56.2" y="2005" width="1.2" height="15.0" fill="rgb(241,15,0)" rx="2" ry="2" />
+<text  x="59.18" y="2015.5" ></text>
+</g>
+<g >
+<title>_dl_init_paths (1 times, 0.10%)</title><rect x="1124.4" y="2005" width="1.2" height="15.0" fill="rgb(243,173,40)" rx="2" ry="2" />
+<text  x="1127.38" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="20.9" y="1941" width="1.3" height="15.0" fill="rgb(210,54,32)" rx="2" ry="2" />
+<text  x="23.94" y="1951.5" ></text>
+</g>
+<g >
+<title>add_history (1 times, 0.10%)</title><rect x="48.9" y="2037" width="1.2" height="15.0" fill="rgb(250,124,35)" rx="2" ry="2" />
+<text  x="51.89" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="513.1" y="2021" width="1.2" height="15.0" fill="rgb(208,121,27)" rx="2" ry="2" />
+<text  x="516.11" y="2031.5" ></text>
+</g>
+<g >
+<title>_rl_set_screen_size (1 times, 0.10%)</title><rect x="87.8" y="2053" width="1.2" height="15.0" fill="rgb(239,193,45)" rx="2" ry="2" />
+<text  x="90.78" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="357" width="1.2" height="15.0" fill="rgb(254,134,25)" rx="2" ry="2" />
+<text  x="20.29" y="367.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="191.1" y="1989" width="1.2" height="15.0" fill="rgb(235,146,4)" rx="2" ry="2" />
+<text  x="194.07" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="518.0" y="2037" width="1.2" height="15.0" fill="rgb(230,191,18)" rx="2" ry="2" />
+<text  x="520.97" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (157 times, 16.17%)</title><rect x="250.6" y="1989" width="190.8" height="15.0" fill="rgb(236,25,30)" rx="2" ry="2" />
+<text  x="253.62" y="1999.5" >do_page_fault</text>
+</g>
+<g >
+<title>_int_free (16 times, 1.65%)</title><rect x="28.2" y="2037" width="19.5" height="15.0" fill="rgb(226,92,20)" rx="2" ry="2" />
+<text  x="31.23" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="405" width="1.2" height="15.0" fill="rgb(251,15,11)" rx="2" ry="2" />
+<text  x="20.29" y="415.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="498.5" y="2021" width="2.5" height="15.0" fill="rgb(245,6,10)" rx="2" ry="2" />
+<text  x="501.53" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="539.8" y="1989" width="6.1" height="15.0" fill="rgb(216,168,49)" rx="2" ry="2" />
+<text  x="542.85" y="1999.5" ></text>
+</g>
+<g >
+<title>Perl_PerlLIO_open_cloexec (1 times, 0.10%)</title><rect x="142.5" y="2005" width="1.2" height="15.0" fill="rgb(206,32,46)" rx="2" ry="2" />
+<text  x="145.46" y="2015.5" ></text>
+</g>
+<g >
+<title>_IO_file_overflow@@GLIBC_2.2.5 (1 times, 0.10%)</title><rect x="25.8" y="2037" width="1.2" height="15.0" fill="rgb(226,35,43)" rx="2" ry="2" />
+<text  x="28.80" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="48.9" y="2021" width="1.2" height="15.0" fill="rgb(206,21,47)" rx="2" ry="2" />
+<text  x="51.89" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1121.9" y="1957" width="1.3" height="15.0" fill="rgb(224,0,39)" rx="2" ry="2" />
+<text  x="1124.95" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1182.7" y="2037" width="1.2" height="15.0" fill="rgb(226,228,23)" rx="2" ry="2" />
+<text  x="1185.71" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="113.3" y="2005" width="1.2" height="15.0" fill="rgb(208,63,46)" rx="2" ry="2" />
+<text  x="116.30" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="70.8" y="2021" width="1.2" height="15.0" fill="rgb(246,84,23)" rx="2" ry="2" />
+<text  x="73.76" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (19 times, 1.96%)</title><rect x="1041.7" y="2021" width="23.1" height="15.0" fill="rgb(235,51,43)" rx="2" ry="2" />
+<text  x="1044.74" y="2031.5" >d..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="72.0" y="1989" width="1.2" height="15.0" fill="rgb(230,150,30)" rx="2" ry="2" />
+<text  x="74.98" y="1999.5" ></text>
+</g>
+<g >
+<title>__getpagesize (1 times, 0.10%)</title><rect x="1146.3" y="2053" width="1.2" height="15.0" fill="rgb(232,28,7)" rx="2" ry="2" />
+<text  x="1149.25" y="2063.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (8 times, 0.82%)</title><rect x="1064.8" y="1941" width="9.8" height="15.0" fill="rgb(245,195,15)" rx="2" ry="2" />
+<text  x="1067.83" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="661" width="1.2" height="15.0" fill="rgb(221,66,26)" rx="2" ry="2" />
+<text  x="20.29" y="671.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 times, 0.41%)</title><rect x="17.3" y="2021" width="4.9" height="15.0" fill="rgb(208,219,45)" rx="2" ry="2" />
+<text  x="20.29" y="2031.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (18 times, 1.85%)</title><rect x="1074.6" y="1941" width="21.8" height="15.0" fill="rgb(248,117,16)" rx="2" ry="2" />
+<text  x="1077.55" y="1951.5" >[..</text>
+</g>
+<g >
+<title>xmalloc (1 times, 0.10%)</title><rect x="78.1" y="2037" width="1.2" height="15.0" fill="rgb(244,24,30)" rx="2" ry="2" />
+<text  x="81.05" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="230.0" y="2005" width="1.2" height="15.0" fill="rgb(247,178,29)" rx="2" ry="2" />
+<text  x="232.96" y="2015.5" ></text>
+</g>
+<g >
+<title>__memset_sse2_unaligned_erms (1 times, 0.10%)</title><rect x="22.2" y="2021" width="1.2" height="15.0" fill="rgb(207,175,51)" rx="2" ry="2" />
+<text  x="25.15" y="2031.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (8 times, 0.82%)</title><rect x="1064.8" y="2005" width="9.8" height="15.0" fill="rgb(209,118,6)" rx="2" ry="2" />
+<text  x="1067.83" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1149.9" y="2005" width="1.2" height="15.0" fill="rgb(245,92,10)" rx="2" ry="2" />
+<text  x="1152.90" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="123.0" y="2037" width="2.4" height="15.0" fill="rgb(238,140,37)" rx="2" ry="2" />
+<text  x="126.02" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1185.1" y="2005" width="1.3" height="15.0" fill="rgb(254,1,16)" rx="2" ry="2" />
+<text  x="1188.14" y="2015.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (7 times, 0.72%)</title><rect x="1075.8" y="1813" width="8.5" height="15.0" fill="rgb(211,208,48)" rx="2" ry="2" />
+<text  x="1078.77" y="1823.5" ></text>
+</g>
+<g >
+<title>Perl_drand48_init_r (1 times, 0.10%)</title><rect x="154.6" y="2005" width="1.2" height="15.0" fill="rgb(216,143,19)" rx="2" ry="2" />
+<text  x="157.61" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1096.4" y="2037" width="1.2" height="15.0" fill="rgb(230,92,27)" rx="2" ry="2" />
+<text  x="1099.43" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="497.3" y="1973" width="1.2" height="15.0" fill="rgb(221,98,12)" rx="2" ry="2" />
+<text  x="500.31" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (21 times, 2.16%)</title><rect x="203.2" y="1973" width="25.5" height="15.0" fill="rgb(219,117,31)" rx="2" ry="2" />
+<text  x="206.22" y="1983.5" >d..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="23.4" y="1973" width="1.2" height="15.0" fill="rgb(231,95,42)" rx="2" ry="2" />
+<text  x="26.37" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="134.0" y="2005" width="1.2" height="15.0" fill="rgb(233,41,30)" rx="2" ry="2" />
+<text  x="136.95" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (9 times, 0.93%)</title><rect x="1168.1" y="2021" width="11.0" height="15.0" fill="rgb(226,145,44)" rx="2" ry="2" />
+<text  x="1171.13" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="143.7" y="1957" width="1.2" height="15.0" fill="rgb(241,49,45)" rx="2" ry="2" />
+<text  x="146.68" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1285" width="1.2" height="15.0" fill="rgb(219,85,10)" rx="2" ry="2" />
+<text  x="20.29" y="1295.5" ></text>
+</g>
+<g >
+<title>__GI_____strtod_l_internal (1 times, 0.10%)</title><rect x="507.0" y="2053" width="1.2" height="15.0" fill="rgb(205,90,34)" rx="2" ry="2" />
+<text  x="510.03" y="2063.5" ></text>
+</g>
+<g >
+<title>_dl_map_object (6 times, 0.62%)</title><rect x="1151.1" y="2053" width="7.3" height="15.0" fill="rgb(243,38,27)" rx="2" ry="2" />
+<text  x="1154.11" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="441.4" y="2005" width="1.2" height="15.0" fill="rgb(241,49,25)" rx="2" ry="2" />
+<text  x="444.41" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="110.9" y="2005" width="1.2" height="15.0" fill="rgb(249,119,8)" rx="2" ry="2" />
+<text  x="113.87" y="2015.5" ></text>
+</g>
+<g >
+<title>hash_insert (1 times, 0.10%)</title><rect x="24.6" y="2021" width="1.2" height="15.0" fill="rgb(231,73,53)" rx="2" ry="2" />
+<text  x="27.58" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="142.5" y="1973" width="1.2" height="15.0" fill="rgb(222,39,53)" rx="2" ry="2" />
+<text  x="145.46" y="1983.5" ></text>
+</g>
+<g >
+<title>_dl_check_map_versions (1 times, 0.10%)</title><rect x="519.2" y="2053" width="1.2" height="15.0" fill="rgb(214,138,21)" rx="2" ry="2" />
+<text  x="522.19" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1038.1" y="2021" width="2.4" height="15.0" fill="rgb(229,127,42)" rx="2" ry="2" />
+<text  x="1041.09" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="488.8" y="1957" width="1.2" height="15.0" fill="rgb(213,54,20)" rx="2" ry="2" />
+<text  x="491.81" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1075.8" y="1749" width="1.2" height="15.0" fill="rgb(208,96,31)" rx="2" ry="2" />
+<text  x="1078.77" y="1759.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="709" width="1.2" height="15.0" fill="rgb(205,22,33)" rx="2" ry="2" />
+<text  x="20.29" y="719.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1477" width="1.2" height="15.0" fill="rgb(206,62,47)" rx="2" ry="2" />
+<text  x="20.29" y="1487.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="449.9" y="1989" width="1.2" height="15.0" fill="rgb(222,44,40)" rx="2" ry="2" />
+<text  x="452.92" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1152.3" y="1989" width="1.2" height="15.0" fill="rgb(231,188,7)" rx="2" ry="2" />
+<text  x="1155.33" y="1999.5" ></text>
+</g>
+<g >
+<title>_dl_new_object (2 times, 0.21%)</title><rect x="446.3" y="2037" width="2.4" height="15.0" fill="rgb(246,222,49)" rx="2" ry="2" />
+<text  x="449.27" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="135.2" y="1989" width="1.2" height="15.0" fill="rgb(239,108,50)" rx="2" ry="2" />
+<text  x="138.17" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="453.6" y="1989" width="1.2" height="15.0" fill="rgb(224,229,43)" rx="2" ry="2" />
+<text  x="456.56" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (7 times, 0.72%)</title><rect x="62.3" y="2005" width="8.5" height="15.0" fill="rgb(215,191,40)" rx="2" ry="2" />
+<text  x="65.26" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="89.0" y="2005" width="2.4" height="15.0" fill="rgb(242,72,40)" rx="2" ry="2" />
+<text  x="91.99" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1125.6" y="1973" width="1.2" height="15.0" fill="rgb(232,127,33)" rx="2" ry="2" />
+<text  x="1128.59" y="1983.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (14 times, 1.44%)</title><rect x="233.6" y="2037" width="17.0" height="15.0" fill="rgb(206,24,39)" rx="2" ry="2" />
+<text  x="236.60" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (23 times, 2.37%)</title><rect x="460.9" y="1973" width="27.9" height="15.0" fill="rgb(252,32,49)" rx="2" ry="2" />
+<text  x="463.85" y="1983.5" >d..</text>
+</g>
+<g >
+<title>[unknown] (23 times, 2.37%)</title><rect x="1115.9" y="2053" width="27.9" height="15.0" fill="rgb(241,22,2)" rx="2" ry="2" />
+<text  x="1118.87" y="2063.5" >[..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1182.7" y="2021" width="1.2" height="15.0" fill="rgb(215,95,39)" rx="2" ry="2" />
+<text  x="1185.71" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1101.3" y="1957" width="1.2" height="15.0" fill="rgb(225,55,31)" rx="2" ry="2" />
+<text  x="1104.29" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (9 times, 0.93%)</title><rect x="1084.3" y="1797" width="10.9" height="15.0" fill="rgb(214,162,39)" rx="2" ry="2" />
+<text  x="1087.27" y="1807.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1589" width="1.2" height="15.0" fill="rgb(219,209,40)" rx="2" ry="2" />
+<text  x="20.29" y="1599.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1142.6" y="2005" width="1.2" height="15.0" fill="rgb(250,24,38)" rx="2" ry="2" />
+<text  x="1145.61" y="2015.5" ></text>
+</g>
+<g >
+<title>__open64_2 (1 times, 0.10%)</title><rect x="513.1" y="2053" width="1.2" height="15.0" fill="rgb(229,37,29)" rx="2" ry="2" />
+<text  x="516.11" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="533.8" y="2021" width="6.0" height="15.0" fill="rgb(230,49,12)" rx="2" ry="2" />
+<text  x="536.77" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1717" width="1.2" height="15.0" fill="rgb(223,64,13)" rx="2" ry="2" />
+<text  x="20.29" y="1727.5" ></text>
+</g>
+<g >
+<title>do_page_fault (10 times, 1.03%)</title><rect x="1025.9" y="2021" width="12.2" height="15.0" fill="rgb(212,54,5)" rx="2" ry="2" />
+<text  x="1028.94" y="2031.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (21 times, 2.16%)</title><rect x="203.2" y="2021" width="25.5" height="15.0" fill="rgb(233,25,26)" rx="2" ry="2" />
+<text  x="206.22" y="2031.5" >_..</text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="165" width="1.2" height="15.0" fill="rgb(215,8,29)" rx="2" ry="2" />
+<text  x="20.29" y="175.5" ></text>
+</g>
+<g >
+<title>[libc-2.31.so] (1 times, 0.10%)</title><rect x="1098.9" y="1973" width="1.2" height="15.0" fill="rgb(238,71,34)" rx="2" ry="2" />
+<text  x="1101.86" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1115.9" y="2005" width="1.2" height="15.0" fill="rgb(214,166,1)" rx="2" ry="2" />
+<text  x="1118.87" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="115.7" y="2037" width="1.2" height="15.0" fill="rgb(246,127,33)" rx="2" ry="2" />
+<text  x="118.73" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="443.8" y="2005" width="1.3" height="15.0" fill="rgb(223,99,47)" rx="2" ry="2" />
+<text  x="446.84" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1151.1" y="2021" width="1.2" height="15.0" fill="rgb(211,176,0)" rx="2" ry="2" />
+<text  x="1154.11" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1146.3" y="2037" width="1.2" height="15.0" fill="rgb(228,30,22)" rx="2" ry="2" />
+<text  x="1149.25" y="2047.5" ></text>
+</g>
+<g >
+<title>__strxfrm_l (5 times, 0.51%)</title><rect x="125.4" y="2021" width="6.1" height="15.0" fill="rgb(251,102,29)" rx="2" ry="2" />
+<text  x="128.45" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="57.4" y="1989" width="2.4" height="15.0" fill="rgb(223,48,10)" rx="2" ry="2" />
+<text  x="60.39" y="1999.5" ></text>
+</g>
+<g >
+<title>_nl_load_locale_from_archive (1 times, 0.10%)</title><rect x="160.7" y="1957" width="1.2" height="15.0" fill="rgb(246,112,42)" rx="2" ry="2" />
+<text  x="163.69" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="112.1" y="2005" width="1.2" height="15.0" fill="rgb(245,224,24)" rx="2" ry="2" />
+<text  x="115.08" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="84.1" y="2037" width="1.2" height="15.0" fill="rgb(250,131,53)" rx="2" ry="2" />
+<text  x="87.13" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="452.3" y="1957" width="1.3" height="15.0" fill="rgb(254,182,51)" rx="2" ry="2" />
+<text  x="455.35" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="112.1" y="2021" width="1.2" height="15.0" fill="rgb(214,137,22)" rx="2" ry="2" />
+<text  x="115.08" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1102.5" y="1941" width="2.4" height="15.0" fill="rgb(208,223,51)" rx="2" ry="2" />
+<text  x="1105.50" y="1951.5" ></text>
+</g>
+<g >
+<title>page_fault (8 times, 0.82%)</title><rect x="144.9" y="1989" width="9.7" height="15.0" fill="rgb(217,202,45)" rx="2" ry="2" />
+<text  x="147.89" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (16 times, 1.65%)</title><rect x="28.2" y="1989" width="19.5" height="15.0" fill="rgb(221,174,50)" rx="2" ry="2" />
+<text  x="31.23" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="160.7" y="1925" width="1.2" height="15.0" fill="rgb(242,72,14)" rx="2" ry="2" />
+<text  x="163.69" y="1935.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="513.1" y="2037" width="1.2" height="15.0" fill="rgb(229,227,14)" rx="2" ry="2" />
+<text  x="516.11" y="2047.5" ></text>
+</g>
+<g >
+<title>wait_for (1 times, 0.10%)</title><rect x="103.6" y="2053" width="1.2" height="15.0" fill="rgb(218,67,20)" rx="2" ry="2" />
+<text  x="106.57" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="149" width="1.2" height="15.0" fill="rgb(226,127,3)" rx="2" ry="2" />
+<text  x="20.29" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 times, 0.72%)</title><rect x="17.3" y="2037" width="8.5" height="15.0" fill="rgb(214,31,13)" rx="2" ry="2" />
+<text  x="20.29" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="73.2" y="1989" width="1.2" height="15.0" fill="rgb(236,168,21)" rx="2" ry="2" />
+<text  x="76.19" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1157.2" y="1989" width="1.2" height="15.0" fill="rgb(232,97,12)" rx="2" ry="2" />
+<text  x="1160.19" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (10 times, 1.03%)</title><rect x="1025.9" y="2005" width="12.2" height="15.0" fill="rgb(211,125,4)" rx="2" ry="2" />
+<text  x="1028.94" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="19.7" y="1941" width="1.2" height="15.0" fill="rgb(236,128,32)" rx="2" ry="2" />
+<text  x="22.72" y="1951.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="51.3" y="2005" width="1.2" height="15.0" fill="rgb(222,128,51)" rx="2" ry="2" />
+<text  x="54.32" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1120.7" y="2021" width="1.2" height="15.0" fill="rgb(231,65,43)" rx="2" ry="2" />
+<text  x="1123.73" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="194.7" y="1973" width="1.2" height="15.0" fill="rgb(252,43,17)" rx="2" ry="2" />
+<text  x="197.72" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1182.7" y="2005" width="1.2" height="15.0" fill="rgb(228,152,42)" rx="2" ry="2" />
+<text  x="1185.71" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="19.7" y="1909" width="1.2" height="15.0" fill="rgb(210,8,25)" rx="2" ry="2" />
+<text  x="22.72" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="453" width="1.2" height="15.0" fill="rgb(229,149,24)" rx="2" ry="2" />
+<text  x="20.29" y="463.5" ></text>
+</g>
+<g >
+<title>JS_CallFunction (18 times, 1.85%)</title><rect x="1074.6" y="2021" width="21.8" height="15.0" fill="rgb(210,20,27)" rx="2" ry="2" />
+<text  x="1077.55" y="2031.5" >J..</text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="805" width="1.2" height="15.0" fill="rgb(233,37,10)" rx="2" ry="2" />
+<text  x="20.29" y="815.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="195.9" y="1941" width="1.2" height="15.0" fill="rgb(247,100,26)" rx="2" ry="2" />
+<text  x="198.93" y="1951.5" ></text>
+</g>
+<g >
+<title>do_page_fault (20 times, 2.06%)</title><rect x="166.8" y="1973" width="24.3" height="15.0" fill="rgb(251,179,43)" rx="2" ry="2" />
+<text  x="169.77" y="1983.5" >d..</text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="76.8" y="2021" width="1.3" height="15.0" fill="rgb(235,144,2)" rx="2" ry="2" />
+<text  x="79.84" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="157.0" y="1989" width="1.3" height="15.0" fill="rgb(208,23,0)" rx="2" ry="2" />
+<text  x="160.04" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="55.0" y="1989" width="1.2" height="15.0" fill="rgb(248,151,0)" rx="2" ry="2" />
+<text  x="57.96" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1189" width="1.2" height="15.0" fill="rgb(254,127,25)" rx="2" ry="2" />
+<text  x="20.29" y="1199.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="89.0" y="2021" width="2.4" height="15.0" fill="rgb(228,226,8)" rx="2" ry="2" />
+<text  x="91.99" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="457.2" y="1941" width="1.2" height="15.0" fill="rgb(249,60,32)" rx="2" ry="2" />
+<text  x="460.21" y="1951.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="515.5" y="2037" width="1.3" height="15.0" fill="rgb(213,19,46)" rx="2" ry="2" />
+<text  x="518.54" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="113.3" y="2037" width="1.2" height="15.0" fill="rgb(214,177,24)" rx="2" ry="2" />
+<text  x="116.30" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="125.4" y="1989" width="6.1" height="15.0" fill="rgb(221,64,10)" rx="2" ry="2" />
+<text  x="128.45" y="1999.5" ></text>
+</g>
+<g >
+<title>decode_prompt_string (1 times, 0.10%)</title><rect x="50.1" y="2037" width="1.2" height="15.0" fill="rgb(216,222,44)" rx="2" ry="2" />
+<text  x="53.10" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1733" width="1.2" height="15.0" fill="rgb(231,11,17)" rx="2" ry="2" />
+<text  x="20.29" y="1743.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1038.1" y="2005" width="2.4" height="15.0" fill="rgb(245,52,25)" rx="2" ry="2" />
+<text  x="1041.09" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1861" width="1.2" height="15.0" fill="rgb(252,220,3)" rx="2" ry="2" />
+<text  x="20.29" y="1871.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="50.1" y="2005" width="1.2" height="15.0" fill="rgb(213,108,17)" rx="2" ry="2" />
+<text  x="53.10" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="981" width="1.2" height="15.0" fill="rgb(224,53,2)" rx="2" ry="2" />
+<text  x="20.29" y="991.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="437" width="1.2" height="15.0" fill="rgb(236,218,13)" rx="2" ry="2" />
+<text  x="20.29" y="447.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1120.7" y="2005" width="1.2" height="15.0" fill="rgb(249,82,33)" rx="2" ry="2" />
+<text  x="1123.73" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="110.9" y="2021" width="1.2" height="15.0" fill="rgb(233,77,11)" rx="2" ry="2" />
+<text  x="113.87" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_load_cache_lookup (1 times, 0.10%)</title><rect x="1151.1" y="2037" width="1.2" height="15.0" fill="rgb(233,113,7)" rx="2" ry="2" />
+<text  x="1154.11" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1112.2" y="1989" width="2.5" height="15.0" fill="rgb(222,188,4)" rx="2" ry="2" />
+<text  x="1115.22" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="516.8" y="2037" width="1.2" height="15.0" fill="rgb(217,94,10)" rx="2" ry="2" />
+<text  x="519.76" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="451.1" y="1973" width="1.2" height="15.0" fill="rgb(230,172,41)" rx="2" ry="2" />
+<text  x="454.13" y="1983.5" ></text>
+</g>
+<g >
+<title>perf_mmap__push (2 times, 0.21%)</title><rect x="1102.5" y="1973" width="2.4" height="15.0" fill="rgb(225,210,47)" rx="2" ry="2" />
+<text  x="1105.50" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1101.3" y="1941" width="1.2" height="15.0" fill="rgb(216,193,32)" rx="2" ry="2" />
+<text  x="1104.29" y="1951.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="228.7" y="1989" width="1.3" height="15.0" fill="rgb(248,185,19)" rx="2" ry="2" />
+<text  x="231.74" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (9 times, 0.93%)</title><rect x="1168.1" y="2005" width="11.0" height="15.0" fill="rgb(234,83,53)" rx="2" ry="2" />
+<text  x="1171.13" y="2015.5" ></text>
+</g>
+<g >
+<title>dispose_word (1 times, 0.10%)</title><rect x="56.2" y="2037" width="1.2" height="15.0" fill="rgb(222,66,52)" rx="2" ry="2" />
+<text  x="59.18" y="2047.5" ></text>
+</g>
+<g >
+<title>__mpn_lshift (1 times, 0.10%)</title><rect x="1118.3" y="2037" width="1.2" height="15.0" fill="rgb(205,196,48)" rx="2" ry="2" />
+<text  x="1121.30" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="157.0" y="1973" width="1.3" height="15.0" fill="rgb(254,30,42)" rx="2" ry="2" />
+<text  x="160.04" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="446.3" y="1989" width="2.4" height="15.0" fill="rgb(227,58,22)" rx="2" ry="2" />
+<text  x="449.27" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (8 times, 0.82%)</title><rect x="1064.8" y="1861" width="9.8" height="15.0" fill="rgb(242,82,53)" rx="2" ry="2" />
+<text  x="1067.83" y="1871.5" ></text>
+</g>
+<g >
+<title>do_page_fault (14 times, 1.44%)</title><rect x="233.6" y="1989" width="17.0" height="15.0" fill="rgb(216,98,2)" rx="2" ry="2" />
+<text  x="236.60" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="164.3" y="1973" width="1.3" height="15.0" fill="rgb(218,83,31)" rx="2" ry="2" />
+<text  x="167.34" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (10 times, 1.03%)</title><rect x="521.6" y="2021" width="12.2" height="15.0" fill="rgb(247,175,3)" rx="2" ry="2" />
+<text  x="524.62" y="2031.5" ></text>
+</g>
+<g >
+<title>__memrchr_ifunc (1 times, 0.10%)</title><rect x="1121.9" y="2005" width="1.3" height="15.0" fill="rgb(249,170,32)" rx="2" ry="2" />
+<text  x="1124.95" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (3 times, 0.31%)</title><rect x="10.0" y="2037" width="3.6" height="15.0" fill="rgb(228,158,32)" rx="2" ry="2" />
+<text  x="13.00" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1149.9" y="2021" width="1.2" height="15.0" fill="rgb(217,93,51)" rx="2" ry="2" />
+<text  x="1152.90" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="197.1" y="1973" width="6.1" height="15.0" fill="rgb(251,45,39)" rx="2" ry="2" />
+<text  x="200.15" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="498.5" y="2005" width="2.5" height="15.0" fill="rgb(252,229,13)" rx="2" ry="2" />
+<text  x="501.53" y="2015.5" ></text>
+</g>
+<g >
+<title>discard_unwind_frame (1 times, 0.10%)</title><rect x="51.3" y="2037" width="1.2" height="15.0" fill="rgb(210,82,42)" rx="2" ry="2" />
+<text  x="54.32" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="165.6" y="1957" width="1.2" height="15.0" fill="rgb(237,48,7)" rx="2" ry="2" />
+<text  x="168.55" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1186.4" y="2005" width="1.2" height="15.0" fill="rgb(205,70,26)" rx="2" ry="2" />
+<text  x="1189.35" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="454.8" y="1973" width="1.2" height="15.0" fill="rgb(250,22,21)" rx="2" ry="2" />
+<text  x="457.78" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (19 times, 1.96%)</title><rect x="1041.7" y="2005" width="23.1" height="15.0" fill="rgb(213,221,1)" rx="2" ry="2" />
+<text  x="1044.74" y="2015.5" >d..</text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="1108.6" y="2005" width="3.6" height="15.0" fill="rgb(238,159,15)" rx="2" ry="2" />
+<text  x="1111.58" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="193.5" y="1957" width="1.2" height="15.0" fill="rgb(209,170,54)" rx="2" ry="2" />
+<text  x="196.50" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="113.3" y="2021" width="1.2" height="15.0" fill="rgb(214,108,28)" rx="2" ry="2" />
+<text  x="116.30" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_important_hwcaps (1 times, 0.10%)</title><rect x="1124.4" y="1989" width="1.2" height="15.0" fill="rgb(252,80,24)" rx="2" ry="2" />
+<text  x="1127.38" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1029" width="1.2" height="15.0" fill="rgb(217,31,12)" rx="2" ry="2" />
+<text  x="20.29" y="1039.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="195.9" y="1973" width="1.2" height="15.0" fill="rgb(213,228,6)" rx="2" ry="2" />
+<text  x="198.93" y="1983.5" ></text>
+</g>
+<g >
+<title>_nl_intern_locale_data (9 times, 0.93%)</title><rect x="1168.1" y="2053" width="11.0" height="15.0" fill="rgb(223,150,8)" rx="2" ry="2" />
+<text  x="1171.13" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1749" width="1.2" height="15.0" fill="rgb(230,213,39)" rx="2" ry="2" />
+<text  x="20.29" y="1759.5" ></text>
+</g>
+<g >
+<title>page_fault (16 times, 1.65%)</title><rect x="28.2" y="2021" width="19.5" height="15.0" fill="rgb(236,178,25)" rx="2" ry="2" />
+<text  x="31.23" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="55.0" y="2005" width="1.2" height="15.0" fill="rgb(245,155,18)" rx="2" ry="2" />
+<text  x="57.96" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="104.8" y="2037" width="6.1" height="15.0" fill="rgb(219,186,28)" rx="2" ry="2" />
+<text  x="107.79" y="2047.5" ></text>
+</g>
+<g >
+<title>__GI___wait4 (1 times, 0.10%)</title><rect x="79.3" y="2053" width="1.2" height="15.0" fill="rgb(232,105,51)" rx="2" ry="2" />
+<text  x="82.27" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="27.0" y="1989" width="1.2" height="15.0" fill="rgb(211,34,22)" rx="2" ry="2" />
+<text  x="30.01" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1557" width="1.2" height="15.0" fill="rgb(209,91,27)" rx="2" ry="2" />
+<text  x="20.29" y="1567.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="513.1" y="2005" width="1.2" height="15.0" fill="rgb(222,91,6)" rx="2" ry="2" />
+<text  x="516.11" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1098.9" y="1957" width="1.2" height="15.0" fill="rgb(219,63,21)" rx="2" ry="2" />
+<text  x="1101.86" y="1967.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (16 times, 1.65%)</title><rect x="1075.8" y="1829" width="19.4" height="15.0" fill="rgb(252,118,11)" rx="2" ry="2" />
+<text  x="1078.77" y="1839.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="501.0" y="1989" width="6.0" height="15.0" fill="rgb(249,88,45)" rx="2" ry="2" />
+<text  x="503.96" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1160.8" y="2005" width="1.2" height="15.0" fill="rgb(213,128,52)" rx="2" ry="2" />
+<text  x="1163.83" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="73.2" y="2021" width="1.2" height="15.0" fill="rgb(205,227,39)" rx="2" ry="2" />
+<text  x="76.19" y="2031.5" ></text>
+</g>
+<g >
+<title>__gettimeofday (1 times, 0.10%)</title><rect x="452.3" y="2005" width="1.3" height="15.0" fill="rgb(246,59,49)" rx="2" ry="2" />
+<text  x="455.35" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (4 times, 0.41%)</title><rect x="98.7" y="2037" width="4.9" height="15.0" fill="rgb(244,29,6)" rx="2" ry="2" />
+<text  x="101.71" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (21 times, 2.16%)</title><rect x="203.2" y="2005" width="25.5" height="15.0" fill="rgb(217,52,33)" rx="2" ry="2" />
+<text  x="206.22" y="2015.5" >p..</text>
+</g>
+<g >
+<title>_dl_important_hwcaps (1 times, 0.10%)</title><rect x="457.2" y="1989" width="1.2" height="15.0" fill="rgb(215,79,2)" rx="2" ry="2" />
+<text  x="460.21" y="1999.5" ></text>
+</g>
+<g >
+<title>all (971 times, 100%)</title><rect x="10.0" y="2085" width="1180.0" height="15.0" fill="rgb(250,29,4)" rx="2" ry="2" />
+<text  x="13.00" y="2095.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (16 times, 1.65%)</title><rect x="1075.8" y="1861" width="19.4" height="15.0" fill="rgb(231,84,27)" rx="2" ry="2" />
+<text  x="1078.77" y="1871.5" ></text>
+</g>
+<g >
+<title>_dl_allocate_tls_storage (1 times, 0.10%)</title><rect x="1119.5" y="2037" width="1.2" height="15.0" fill="rgb(246,96,32)" rx="2" ry="2" />
+<text  x="1122.52" y="2047.5" ></text>
+</g>
+<g >
+<title>run_builtin (6 times, 0.62%)</title><rect x="1097.6" y="2021" width="7.3" height="15.0" fill="rgb(229,51,43)" rx="2" ry="2" />
+<text  x="1100.64" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (52 times, 5.36%)</title><rect x="140.0" y="2021" width="63.2" height="15.0" fill="rgb(217,67,15)" rx="2" ry="2" />
+<text  x="143.03" y="2031.5" >[unkno..</text>
+</g>
+<g >
+<title>page_fault (4 times, 0.41%)</title><rect x="1126.8" y="1989" width="4.9" height="15.0" fill="rgb(228,8,41)" rx="2" ry="2" />
+<text  x="1129.81" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (9 times, 0.93%)</title><rect x="1084.3" y="1781" width="10.9" height="15.0" fill="rgb(225,140,46)" rx="2" ry="2" />
+<text  x="1087.27" y="1791.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1845" width="1.2" height="15.0" fill="rgb(220,188,28)" rx="2" ry="2" />
+<text  x="20.29" y="1855.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1100.1" y="1957" width="1.2" height="15.0" fill="rgb(224,97,17)" rx="2" ry="2" />
+<text  x="1103.07" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1188.8" y="2021" width="1.2" height="15.0" fill="rgb(240,60,28)" rx="2" ry="2" />
+<text  x="1191.78" y="2031.5" ></text>
+</g>
+<g >
+<title>__fpending (1 times, 0.10%)</title><rect x="1117.1" y="2037" width="1.2" height="15.0" fill="rgb(212,54,14)" rx="2" ry="2" />
+<text  x="1120.09" y="2047.5" ></text>
+</g>
+<g >
+<title>__exp_finite@GLIBC_2.15 (1 times, 0.10%)</title><rect x="451.1" y="2005" width="1.2" height="15.0" fill="rgb(223,168,36)" rx="2" ry="2" />
+<text  x="454.13" y="2015.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1 times, 0.10%)</title><rect x="84.1" y="2053" width="1.2" height="15.0" fill="rgb(228,125,31)" rx="2" ry="2" />
+<text  x="87.13" y="2063.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1074.6" y="1877" width="1.2" height="15.0" fill="rgb(235,81,38)" rx="2" ry="2" />
+<text  x="1077.55" y="1887.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="116.9" y="2005" width="1.3" height="15.0" fill="rgb(252,220,12)" rx="2" ry="2" />
+<text  x="119.94" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="309" width="1.2" height="15.0" fill="rgb(213,190,25)" rx="2" ry="2" />
+<text  x="20.29" y="319.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="80.5" y="2021" width="3.6" height="15.0" fill="rgb(234,86,36)" rx="2" ry="2" />
+<text  x="83.48" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1117.1" y="1989" width="1.2" height="15.0" fill="rgb(239,0,19)" rx="2" ry="2" />
+<text  x="1120.09" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="508.2" y="2021" width="1.3" height="15.0" fill="rgb(213,186,7)" rx="2" ry="2" />
+<text  x="511.25" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="132.7" y="2021" width="1.3" height="15.0" fill="rgb(248,203,6)" rx="2" ry="2" />
+<text  x="135.74" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="158.3" y="1957" width="1.2" height="15.0" fill="rgb(231,91,7)" rx="2" ry="2" />
+<text  x="161.26" y="1967.5" ></text>
+</g>
+<g >
+<title>_dl_map_object (21 times, 2.16%)</title><rect x="520.4" y="2053" width="25.5" height="15.0" fill="rgb(213,95,35)" rx="2" ry="2" />
+<text  x="523.40" y="2063.5" >_..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1097.6" y="1925" width="1.3" height="15.0" fill="rgb(234,131,40)" rx="2" ry="2" />
+<text  x="1100.64" y="1935.5" ></text>
+</g>
+<g >
+<title>sleep (62 times, 6.39%)</title><rect x="1114.7" y="2069" width="75.3" height="15.0" fill="rgb(231,194,28)" rx="2" ry="2" />
+<text  x="1117.65" y="2079.5" >sleep</text>
+</g>
+<g >
+<title>init_cacheinfo (1 times, 0.10%)</title><rect x="1182.7" y="2053" width="1.2" height="15.0" fill="rgb(235,17,33)" rx="2" ry="2" />
+<text  x="1185.71" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="24.6" y="1973" width="1.2" height="15.0" fill="rgb(216,78,45)" rx="2" ry="2" />
+<text  x="27.58" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="123.0" y="2021" width="2.4" height="15.0" fill="rgb(212,191,50)" rx="2" ry="2" />
+<text  x="126.02" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1637" width="1.2" height="15.0" fill="rgb(231,26,49)" rx="2" ry="2" />
+<text  x="20.29" y="1647.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1141" width="1.2" height="15.0" fill="rgb(229,64,42)" rx="2" ry="2" />
+<text  x="20.29" y="1151.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="25.8" y="1989" width="1.2" height="15.0" fill="rgb(244,43,13)" rx="2" ry="2" />
+<text  x="28.80" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="98.7" y="2005" width="4.9" height="15.0" fill="rgb(242,202,5)" rx="2" ry="2" />
+<text  x="101.71" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="141.2" y="1957" width="1.3" height="15.0" fill="rgb(248,46,15)" rx="2" ry="2" />
+<text  x="144.25" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="449.9" y="1973" width="1.2" height="15.0" fill="rgb(224,67,20)" rx="2" ry="2" />
+<text  x="452.92" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="519.2" y="2021" width="1.2" height="15.0" fill="rgb(251,147,11)" rx="2" ry="2" />
+<text  x="522.19" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="112.1" y="2037" width="1.2" height="15.0" fill="rgb(227,139,13)" rx="2" ry="2" />
+<text  x="115.08" y="2047.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (1 times, 0.10%)</title><rect x="1074.6" y="1893" width="1.2" height="15.0" fill="rgb(240,216,25)" rx="2" ry="2" />
+<text  x="1077.55" y="1903.5" ></text>
+</g>
+<g >
+<title>sysmalloc (1 times, 0.10%)</title><rect x="1188.8" y="2053" width="1.2" height="15.0" fill="rgb(250,167,37)" rx="2" ry="2" />
+<text  x="1191.78" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (6 times, 0.62%)</title><rect x="1077.0" y="1781" width="7.3" height="15.0" fill="rgb(216,58,53)" rx="2" ry="2" />
+<text  x="1079.98" y="1791.5" ></text>
+</g>
+<g >
+<title>_init (3 times, 0.31%)</title><rect x="1162.0" y="2053" width="3.7" height="15.0" fill="rgb(216,58,28)" rx="2" ry="2" />
+<text  x="1165.05" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="75.6" y="2021" width="1.2" height="15.0" fill="rgb(248,190,13)" rx="2" ry="2" />
+<text  x="78.62" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (9 times, 0.93%)</title><rect x="1084.3" y="1813" width="10.9" height="15.0" fill="rgb(231,168,9)" rx="2" ry="2" />
+<text  x="1087.27" y="1823.5" ></text>
+</g>
+<g >
+<title>_dl_map_object (1 times, 0.10%)</title><rect x="459.6" y="2005" width="1.3" height="15.0" fill="rgb(246,79,25)" rx="2" ry="2" />
+<text  x="462.64" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="115.7" y="2021" width="1.2" height="15.0" fill="rgb(245,161,20)" rx="2" ry="2" />
+<text  x="118.73" y="2031.5" ></text>
+</g>
+<g >
+<title>memset (1 times, 0.10%)</title><rect x="1157.2" y="2037" width="1.2" height="15.0" fill="rgb(221,214,14)" rx="2" ry="2" />
+<text  x="1160.19" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1157.2" y="2005" width="1.2" height="15.0" fill="rgb(245,170,22)" rx="2" ry="2" />
+<text  x="1160.19" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="1162.0" y="2021" width="3.7" height="15.0" fill="rgb(237,78,16)" rx="2" ry="2" />
+<text  x="1165.05" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="142.5" y="1989" width="1.2" height="15.0" fill="rgb(248,226,50)" rx="2" ry="2" />
+<text  x="145.46" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 times, 0.82%)</title><rect x="1064.8" y="2037" width="9.8" height="15.0" fill="rgb(214,169,8)" rx="2" ry="2" />
+<text  x="1067.83" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="73.2" y="2005" width="1.2" height="15.0" fill="rgb(225,90,7)" rx="2" ry="2" />
+<text  x="76.19" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="51.3" y="1989" width="1.2" height="15.0" fill="rgb(214,23,20)" rx="2" ry="2" />
+<text  x="54.32" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="89.0" y="2037" width="2.4" height="15.0" fill="rgb(241,191,40)" rx="2" ry="2" />
+<text  x="91.99" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="516.8" y="2005" width="1.2" height="15.0" fill="rgb(220,191,3)" rx="2" ry="2" />
+<text  x="519.76" y="2015.5" ></text>
+</g>
+<g >
+<title>Perl_yyparse (1 times, 0.10%)</title><rect x="120.6" y="2053" width="1.2" height="15.0" fill="rgb(229,75,15)" rx="2" ry="2" />
+<text  x="123.59" y="2063.5" ></text>
+</g>
+<g >
+<title>_IO_fflush (1 times, 0.10%)</title><rect x="17.3" y="85" width="1.2" height="15.0" fill="rgb(231,202,18)" rx="2" ry="2" />
+<text  x="20.29" y="95.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1429" width="1.2" height="15.0" fill="rgb(233,92,8)" rx="2" ry="2" />
+<text  x="20.29" y="1439.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="509.5" y="2005" width="1.2" height="15.0" fill="rgb(215,228,35)" rx="2" ry="2" />
+<text  x="512.46" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="50.1" y="2021" width="1.2" height="15.0" fill="rgb(250,105,22)" rx="2" ry="2" />
+<text  x="53.10" y="2031.5" ></text>
+</g>
+<g >
+<title>throw_to_top_level (1 times, 0.10%)</title><rect x="19.7" y="1957" width="1.2" height="15.0" fill="rgb(208,29,50)" rx="2" ry="2" />
+<text  x="22.72" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (16 times, 1.65%)</title><rect x="28.2" y="2005" width="19.5" height="15.0" fill="rgb(223,72,15)" rx="2" ry="2" />
+<text  x="31.23" y="2015.5" ></text>
+</g>
+<g >
+<title>_int_realloc (5 times, 0.51%)</title><rect x="501.0" y="2037" width="6.0" height="15.0" fill="rgb(209,152,18)" rx="2" ry="2" />
+<text  x="503.96" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="693" width="1.2" height="15.0" fill="rgb(243,141,32)" rx="2" ry="2" />
+<text  x="20.29" y="703.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="231.2" y="2021" width="2.4" height="15.0" fill="rgb(240,114,12)" rx="2" ry="2" />
+<text  x="234.17" y="2031.5" ></text>
+</g>
+<g >
+<title>Perl_pad_new (1 times, 0.10%)</title><rect x="113.3" y="2053" width="1.2" height="15.0" fill="rgb(221,29,37)" rx="2" ry="2" />
+<text  x="116.30" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="131.5" y="2021" width="1.2" height="15.0" fill="rgb(235,73,13)" rx="2" ry="2" />
+<text  x="134.52" y="2031.5" ></text>
+</g>
+<g >
+<title>sh_closepipe (1 times, 0.10%)</title><rect x="74.4" y="2037" width="1.2" height="15.0" fill="rgb(246,193,3)" rx="2" ry="2" />
+<text  x="77.41" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1185.1" y="1989" width="1.3" height="15.0" fill="rgb(232,140,16)" rx="2" ry="2" />
+<text  x="1188.14" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1205" width="1.2" height="15.0" fill="rgb(231,79,21)" rx="2" ry="2" />
+<text  x="20.29" y="1215.5" ></text>
+</g>
+<g >
+<title>sig_handler (1 times, 0.10%)</title><rect x="1097.6" y="1957" width="1.3" height="15.0" fill="rgb(226,227,43)" rx="2" ry="2" />
+<text  x="1100.64" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1106.1" y="1989" width="2.5" height="15.0" fill="rgb(249,185,34)" rx="2" ry="2" />
+<text  x="1109.15" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="228.7" y="2005" width="1.3" height="15.0" fill="rgb(208,135,28)" rx="2" ry="2" />
+<text  x="231.74" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (9 times, 0.93%)</title><rect x="1168.1" y="2037" width="11.0" height="15.0" fill="rgb(221,79,53)" rx="2" ry="2" />
+<text  x="1171.13" y="2047.5" ></text>
+</g>
+<g >
+<title>__vsnprintf_internal (2 times, 0.21%)</title><rect x="192.3" y="2005" width="2.4" height="15.0" fill="rgb(249,228,18)" rx="2" ry="2" />
+<text  x="195.29" y="2015.5" ></text>
+</g>
+<g >
+<title>_dl_sysdep_start (43 times, 4.43%)</title><rect x="448.7" y="2037" width="52.3" height="15.0" fill="rgb(240,97,50)" rx="2" ry="2" />
+<text  x="451.70" y="2047.5" >_dl_s..</text>
+</g>
+<g >
+<title>do_page_fault (14 times, 1.44%)</title><rect x="233.6" y="2005" width="17.0" height="15.0" fill="rgb(254,191,11)" rx="2" ry="2" />
+<text  x="236.60" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="446.3" y="2005" width="2.4" height="15.0" fill="rgb(216,16,32)" rx="2" ry="2" />
+<text  x="449.27" y="2015.5" ></text>
+</g>
+<g >
+<title>getopt_long (1 times, 0.10%)</title><rect x="1141.4" y="2037" width="1.2" height="15.0" fill="rgb(244,161,11)" rx="2" ry="2" />
+<text  x="1144.39" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (8 times, 0.82%)</title><rect x="144.9" y="1973" width="9.7" height="15.0" fill="rgb(230,20,16)" rx="2" ry="2" />
+<text  x="147.89" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1096.4" y="2021" width="1.2" height="15.0" fill="rgb(218,128,15)" rx="2" ry="2" />
+<text  x="1099.43" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1781" width="1.2" height="15.0" fill="rgb(208,213,23)" rx="2" ry="2" />
+<text  x="20.29" y="1791.5" ></text>
+</g>
+<g >
+<title>_dl_start (2 times, 0.21%)</title><rect x="1158.4" y="2037" width="2.4" height="15.0" fill="rgb(236,157,8)" rx="2" ry="2" />
+<text  x="1161.40" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="161.9" y="1957" width="2.4" height="15.0" fill="rgb(252,41,0)" rx="2" ry="2" />
+<text  x="164.91" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1120.7" y="1989" width="1.2" height="15.0" fill="rgb(243,129,25)" rx="2" ry="2" />
+<text  x="1123.73" y="1999.5" ></text>
+</g>
+<g >
+<title>Perl__mem_collxfrm (5 times, 0.51%)</title><rect x="125.4" y="2037" width="6.1" height="15.0" fill="rgb(216,11,14)" rx="2" ry="2" />
+<text  x="128.45" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1317" width="1.2" height="15.0" fill="rgb(243,96,26)" rx="2" ry="2" />
+<text  x="20.29" y="1327.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="1112.2" y="2005" width="2.5" height="15.0" fill="rgb(205,106,32)" rx="2" ry="2" />
+<text  x="1115.22" y="2015.5" ></text>
+</g>
+<g >
+<title>sysmalloc (19 times, 1.96%)</title><rect x="1041.7" y="2053" width="23.1" height="15.0" fill="rgb(218,104,31)" rx="2" ry="2" />
+<text  x="1044.74" y="2063.5" >s..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="514.3" y="2005" width="1.2" height="15.0" fill="rgb(239,145,53)" rx="2" ry="2" />
+<text  x="517.33" y="2015.5" ></text>
+</g>
+<g >
+<title>getenv (1 times, 0.10%)</title><rect x="1101.3" y="1973" width="1.2" height="15.0" fill="rgb(215,179,35)" rx="2" ry="2" />
+<text  x="1104.29" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1143.8" y="2021" width="1.2" height="15.0" fill="rgb(218,77,18)" rx="2" ry="2" />
+<text  x="1146.82" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="597" width="1.2" height="15.0" fill="rgb(220,62,42)" rx="2" ry="2" />
+<text  x="20.29" y="607.5" ></text>
+</g>
+<g >
+<title>page_fault (387 times, 39.86%)</title><rect x="555.6" y="2037" width="470.3" height="15.0" fill="rgb(205,227,36)" rx="2" ry="2" />
+<text  x="558.64" y="2047.5" >page_fault</text>
+</g>
+<g >
+<title>list_length (1 times, 0.10%)</title><rect x="61.0" y="2037" width="1.3" height="15.0" fill="rgb(254,35,33)" rx="2" ry="2" />
+<text  x="64.04" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1095.2" y="1765" width="1.2" height="15.0" fill="rgb(221,143,4)" rx="2" ry="2" />
+<text  x="1098.21" y="1775.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="50.1" y="1989" width="1.2" height="15.0" fill="rgb(211,23,6)" rx="2" ry="2" />
+<text  x="53.10" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1061" width="1.2" height="15.0" fill="rgb(236,75,6)" rx="2" ry="2" />
+<text  x="20.29" y="1071.5" ></text>
+</g>
+<g >
+<title>__newlocale (1 times, 0.10%)</title><rect x="195.9" y="1989" width="1.2" height="15.0" fill="rgb(253,36,35)" rx="2" ry="2" />
+<text  x="198.93" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1098.9" y="1941" width="1.2" height="15.0" fill="rgb(237,5,41)" rx="2" ry="2" />
+<text  x="1101.86" y="1951.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="448.7" y="1957" width="1.2" height="15.0" fill="rgb(212,105,40)" rx="2" ry="2" />
+<text  x="451.70" y="1967.5" ></text>
+</g>
+<g >
+<title>_init (5 times, 0.51%)</title><rect x="549.6" y="2053" width="6.0" height="15.0" fill="rgb(227,29,38)" rx="2" ry="2" />
+<text  x="552.57" y="2063.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1 times, 0.10%)</title><rect x="511.9" y="2053" width="1.2" height="15.0" fill="rgb(205,50,44)" rx="2" ry="2" />
+<text  x="514.89" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1160.8" y="1989" width="1.2" height="15.0" fill="rgb(228,9,36)" rx="2" ry="2" />
+<text  x="1163.83" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="159.5" y="1957" width="1.2" height="15.0" fill="rgb(207,216,18)" rx="2" ry="2" />
+<text  x="162.47" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="490.0" y="1989" width="2.5" height="15.0" fill="rgb(240,58,15)" rx="2" ry="2" />
+<text  x="493.02" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="501.0" y="2005" width="6.0" height="15.0" fill="rgb(213,166,44)" rx="2" ry="2" />
+<text  x="503.96" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="22.2" y="1989" width="1.2" height="15.0" fill="rgb(237,50,48)" rx="2" ry="2" />
+<text  x="25.15" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 times, 0.31%)</title><rect x="17.3" y="1973" width="3.6" height="15.0" fill="rgb(221,57,54)" rx="2" ry="2" />
+<text  x="20.29" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1157.2" y="2021" width="1.2" height="15.0" fill="rgb(250,127,35)" rx="2" ry="2" />
+<text  x="1160.19" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="155.8" y="1989" width="1.2" height="15.0" fill="rgb(240,42,7)" rx="2" ry="2" />
+<text  x="158.83" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="85.3" y="2021" width="2.5" height="15.0" fill="rgb(249,170,8)" rx="2" ry="2" />
+<text  x="88.35" y="2031.5" ></text>
+</g>
+<g >
+<title>Perl_re_op_compile (1 times, 0.10%)</title><rect x="158.3" y="2005" width="1.2" height="15.0" fill="rgb(234,15,17)" rx="2" ry="2" />
+<text  x="161.26" y="2015.5" ></text>
+</g>
+<g >
+<title>__wrap_scalbn (1 times, 0.10%)</title><rect x="516.8" y="2053" width="1.2" height="15.0" fill="rgb(219,170,20)" rx="2" ry="2" />
+<text  x="519.76" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (20 times, 2.06%)</title><rect x="166.8" y="1989" width="24.3" height="15.0" fill="rgb(222,186,12)" rx="2" ry="2" />
+<text  x="169.77" y="1999.5" >p..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="27.0" y="2005" width="1.2" height="15.0" fill="rgb(235,3,36)" rx="2" ry="2" />
+<text  x="30.01" y="2015.5" ></text>
+</g>
+<g >
+<title>_dl_load_cache_lookup (1 times, 0.10%)</title><rect x="520.4" y="2037" width="1.2" height="15.0" fill="rgb(250,75,24)" rx="2" ry="2" />
+<text  x="523.40" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1147.5" y="2021" width="1.2" height="15.0" fill="rgb(242,172,37)" rx="2" ry="2" />
+<text  x="1150.47" y="2031.5" ></text>
+</g>
+<g >
+<title>Perl_safesyscalloc (1 times, 0.10%)</title><rect x="115.7" y="2053" width="1.2" height="15.0" fill="rgb(227,131,42)" rx="2" ry="2" />
+<text  x="118.73" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="456.0" y="1957" width="1.2" height="15.0" fill="rgb(250,102,35)" rx="2" ry="2" />
+<text  x="458.99" y="1967.5" ></text>
+</g>
+<g >
+<title>PerlIO_init (1 times, 0.10%)</title><rect x="140.0" y="2005" width="1.2" height="15.0" fill="rgb(226,3,26)" rx="2" ry="2" />
+<text  x="143.03" y="2015.5" ></text>
+</g>
+<g >
+<title>gnome-shell (26 times, 2.68%)</title><rect x="1064.8" y="2069" width="31.6" height="15.0" fill="rgb(222,127,36)" rx="2" ry="2" />
+<text  x="1067.83" y="2079.5" >gn..</text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1829" width="1.2" height="15.0" fill="rgb(215,118,37)" rx="2" ry="2" />
+<text  x="20.29" y="1839.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="498.5" y="1989" width="2.5" height="15.0" fill="rgb(222,226,9)" rx="2" ry="2" />
+<text  x="501.53" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="446.3" y="2021" width="2.4" height="15.0" fill="rgb(218,173,42)" rx="2" ry="2" />
+<text  x="449.27" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="917" width="1.2" height="15.0" fill="rgb(216,122,5)" rx="2" ry="2" />
+<text  x="20.29" y="927.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1074.6" y="1829" width="1.2" height="15.0" fill="rgb(229,37,20)" rx="2" ry="2" />
+<text  x="1077.55" y="1839.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="1108.6" y="1989" width="3.6" height="15.0" fill="rgb(209,82,41)" rx="2" ry="2" />
+<text  x="1111.58" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="492.5" y="1973" width="4.8" height="15.0" fill="rgb(222,5,35)" rx="2" ry="2" />
+<text  x="495.45" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1158.4" y="2021" width="2.4" height="15.0" fill="rgb(205,19,19)" rx="2" ry="2" />
+<text  x="1161.40" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="488.8" y="1989" width="1.2" height="15.0" fill="rgb(216,2,49)" rx="2" ry="2" />
+<text  x="491.81" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="87.8" y="2021" width="1.2" height="15.0" fill="rgb(248,165,31)" rx="2" ry="2" />
+<text  x="90.78" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (3 times, 0.31%)</title><rect x="1162.0" y="2037" width="3.7" height="15.0" fill="rgb(250,69,15)" rx="2" ry="2" />
+<text  x="1165.05" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="453.6" y="1957" width="1.2" height="15.0" fill="rgb(235,23,43)" rx="2" ry="2" />
+<text  x="456.56" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="545.9" y="2021" width="2.5" height="15.0" fill="rgb(247,36,29)" rx="2" ry="2" />
+<text  x="548.92" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="25.8" y="2005" width="1.2" height="15.0" fill="rgb(212,31,4)" rx="2" ry="2" />
+<text  x="28.80" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1123.2" y="1989" width="1.2" height="15.0" fill="rgb(222,146,32)" rx="2" ry="2" />
+<text  x="1126.16" y="1999.5" ></text>
+</g>
+<g >
+<title>perf_evlist__poll_thread (2 times, 0.21%)</title><rect x="1106.1" y="2037" width="2.5" height="15.0" fill="rgb(247,40,28)" rx="2" ry="2" />
+<text  x="1109.15" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1221" width="1.2" height="15.0" fill="rgb(229,113,31)" rx="2" ry="2" />
+<text  x="20.29" y="1231.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="118.2" y="2021" width="2.4" height="15.0" fill="rgb(222,136,54)" rx="2" ry="2" />
+<text  x="121.16" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1117.1" y="2005" width="1.2" height="15.0" fill="rgb(254,74,20)" rx="2" ry="2" />
+<text  x="1120.09" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1413" width="1.2" height="15.0" fill="rgb(205,103,9)" rx="2" ry="2" />
+<text  x="20.29" y="1423.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1160.8" y="2021" width="1.2" height="15.0" fill="rgb(228,21,50)" rx="2" ry="2" />
+<text  x="1163.83" y="2031.5" ></text>
+</g>
+<g >
+<title>Perl_Slab_Alloc (5 times, 0.51%)</title><rect x="104.8" y="2053" width="6.1" height="15.0" fill="rgb(254,107,20)" rx="2" ry="2" />
+<text  x="107.79" y="2063.5" ></text>
+</g>
+<g >
+<title>perf_evlist__poll (1 times, 0.10%)</title><rect x="1097.6" y="1989" width="1.3" height="15.0" fill="rgb(214,97,3)" rx="2" ry="2" />
+<text  x="1100.64" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1045" width="1.2" height="15.0" fill="rgb(214,229,15)" rx="2" ry="2" />
+<text  x="20.29" y="1055.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1181.5" y="2005" width="1.2" height="15.0" fill="rgb(238,172,47)" rx="2" ry="2" />
+<text  x="1184.49" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="103.6" y="2005" width="1.2" height="15.0" fill="rgb(225,64,20)" rx="2" ry="2" />
+<text  x="106.57" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="118.2" y="2037" width="2.4" height="15.0" fill="rgb(234,21,34)" rx="2" ry="2" />
+<text  x="121.16" y="2047.5" ></text>
+</g>
+<g >
+<title>start_thread (2 times, 0.21%)</title><rect x="1106.1" y="2053" width="2.5" height="15.0" fill="rgb(214,157,36)" rx="2" ry="2" />
+<text  x="1109.15" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="448.7" y="1989" width="1.2" height="15.0" fill="rgb(207,15,42)" rx="2" ry="2" />
+<text  x="451.70" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="114.5" y="2021" width="1.2" height="15.0" fill="rgb(233,20,53)" rx="2" ry="2" />
+<text  x="117.51" y="2031.5" ></text>
+</g>
+<g >
+<title>[sleep] (1 times, 0.10%)</title><rect x="1114.7" y="2053" width="1.2" height="15.0" fill="rgb(239,183,43)" rx="2" ry="2" />
+<text  x="1117.65" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="57.4" y="2021" width="2.4" height="15.0" fill="rgb(253,130,48)" rx="2" ry="2" />
+<text  x="60.39" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="140.0" y="1973" width="1.2" height="15.0" fill="rgb(245,77,43)" rx="2" ry="2" />
+<text  x="143.03" y="1983.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (18 times, 1.85%)</title><rect x="1074.6" y="1957" width="21.8" height="15.0" fill="rgb(216,168,27)" rx="2" ry="2" />
+<text  x="1077.55" y="1967.5" >[..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="114.5" y="2005" width="1.2" height="15.0" fill="rgb(230,219,27)" rx="2" ry="2" />
+<text  x="117.51" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="56.2" y="1989" width="1.2" height="15.0" fill="rgb(227,4,29)" rx="2" ry="2" />
+<text  x="59.18" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="933" width="1.2" height="15.0" fill="rgb(242,28,44)" rx="2" ry="2" />
+<text  x="20.29" y="943.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1137.7" y="1957" width="1.3" height="15.0" fill="rgb(226,36,28)" rx="2" ry="2" />
+<text  x="1140.74" y="1967.5" ></text>
+</g>
+<g >
+<title>_start (2 times, 0.21%)</title><rect x="1038.1" y="2053" width="2.4" height="15.0" fill="rgb(238,172,32)" rx="2" ry="2" />
+<text  x="1041.09" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="52.5" y="1989" width="1.2" height="15.0" fill="rgb(244,19,12)" rx="2" ry="2" />
+<text  x="55.53" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1013" width="1.2" height="15.0" fill="rgb(215,57,1)" rx="2" ry="2" />
+<text  x="20.29" y="1023.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="103.6" y="2021" width="1.2" height="15.0" fill="rgb(210,215,46)" rx="2" ry="2" />
+<text  x="106.57" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_start_user (3 times, 0.31%)</title><rect x="1158.4" y="2053" width="3.6" height="15.0" fill="rgb(210,118,7)" rx="2" ry="2" />
+<text  x="1161.40" y="2063.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1181.5" y="2021" width="1.2" height="15.0" fill="rgb(209,41,53)" rx="2" ry="2" />
+<text  x="1184.49" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_relocate_object (23 times, 2.37%)</title><rect x="460.9" y="2005" width="27.9" height="15.0" fill="rgb(228,138,3)" rx="2" ry="2" />
+<text  x="463.85" y="2015.5" >_..</text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="18.5" y="1909" width="1.2" height="15.0" fill="rgb(225,111,30)" rx="2" ry="2" />
+<text  x="21.51" y="1919.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="138.8" y="2005" width="1.2" height="15.0" fill="rgb(243,108,37)" rx="2" ry="2" />
+<text  x="141.82" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="421" width="1.2" height="15.0" fill="rgb(233,202,24)" rx="2" ry="2" />
+<text  x="20.29" y="431.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="121.8" y="2037" width="1.2" height="15.0" fill="rgb(230,63,53)" rx="2" ry="2" />
+<text  x="124.80" y="2047.5" ></text>
+</g>
+<g >
+<title>__vfprintf_internal (1 times, 0.10%)</title><rect x="191.1" y="2005" width="1.2" height="15.0" fill="rgb(234,56,36)" rx="2" ry="2" />
+<text  x="194.07" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="118.2" y="2005" width="2.4" height="15.0" fill="rgb(254,73,6)" rx="2" ry="2" />
+<text  x="121.16" y="2015.5" ></text>
+</g>
+<g >
+<title>[libgjs.so.0.0.0] (8 times, 0.82%)</title><rect x="1064.8" y="2053" width="9.8" height="15.0" fill="rgb(218,191,43)" rx="2" ry="2" />
+<text  x="1067.83" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="539.8" y="2021" width="6.1" height="15.0" fill="rgb(253,9,33)" rx="2" ry="2" />
+<text  x="542.85" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1957" width="1.2" height="15.0" fill="rgb(239,83,49)" rx="2" ry="2" />
+<text  x="20.29" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1123.2" y="1973" width="1.2" height="15.0" fill="rgb(205,111,39)" rx="2" ry="2" />
+<text  x="1126.16" y="1983.5" ></text>
+</g>
+<g >
+<title>Perl__new_invlist_C_array (8 times, 0.82%)</title><rect x="144.9" y="2005" width="9.7" height="15.0" fill="rgb(216,14,9)" rx="2" ry="2" />
+<text  x="147.89" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (2 times, 0.21%)</title><rect x="1165.7" y="2037" width="2.4" height="15.0" fill="rgb(222,151,15)" rx="2" ry="2" />
+<text  x="1168.70" y="2047.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (16 times, 1.65%)</title><rect x="1075.8" y="1845" width="19.4" height="15.0" fill="rgb(213,170,7)" rx="2" ry="2" />
+<text  x="1078.77" y="1855.5" ></text>
+</g>
+<g >
+<title>__libc_csu_init (1 times, 0.10%)</title><rect x="510.7" y="2053" width="1.2" height="15.0" fill="rgb(247,92,31)" rx="2" ry="2" />
+<text  x="513.68" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="61.0" y="2021" width="1.3" height="15.0" fill="rgb(209,85,11)" rx="2" ry="2" />
+<text  x="64.04" y="2031.5" ></text>
+</g>
+<g >
+<title>__cxa_atexit (1 times, 0.10%)</title><rect x="509.5" y="2053" width="1.2" height="15.0" fill="rgb(230,133,7)" rx="2" ry="2" />
+<text  x="512.46" y="2063.5" ></text>
+</g>
+<g >
+<title>_dl_addr (1 times, 0.10%)</title><rect x="1149.9" y="2053" width="1.2" height="15.0" fill="rgb(247,141,5)" rx="2" ry="2" />
+<text  x="1152.90" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="629" width="1.2" height="15.0" fill="rgb(244,45,46)" rx="2" ry="2" />
+<text  x="20.29" y="639.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="87.8" y="2005" width="1.2" height="15.0" fill="rgb(216,95,23)" rx="2" ry="2" />
+<text  x="90.78" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1925" width="1.2" height="15.0" fill="rgb(246,76,35)" rx="2" ry="2" />
+<text  x="20.29" y="1935.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="72.0" y="2005" width="1.2" height="15.0" fill="rgb(224,191,31)" rx="2" ry="2" />
+<text  x="74.98" y="2015.5" ></text>
+</g>
+<g >
+<title>Perl_newSVpvn (1 times, 0.10%)</title><rect x="134.0" y="2037" width="1.2" height="15.0" fill="rgb(238,56,34)" rx="2" ry="2" />
+<text  x="136.95" y="2047.5" ></text>
+</g>
+<g >
+<title>getenv (1 times, 0.10%)</title><rect x="194.7" y="2005" width="1.2" height="15.0" fill="rgb(222,217,21)" rx="2" ry="2" />
+<text  x="197.72" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="155.8" y="1973" width="1.2" height="15.0" fill="rgb(237,20,15)" rx="2" ry="2" />
+<text  x="158.83" y="1983.5" ></text>
+</g>
+<g >
+<title>make_child (7 times, 0.72%)</title><rect x="62.3" y="2037" width="8.5" height="15.0" fill="rgb(246,180,9)" rx="2" ry="2" />
+<text  x="65.26" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="230.0" y="1989" width="1.2" height="15.0" fill="rgb(206,53,44)" rx="2" ry="2" />
+<text  x="232.96" y="1999.5" ></text>
+</g>
+<g >
+<title>[libmozjs-68.so.68.6.0] (18 times, 1.85%)</title><rect x="1074.6" y="2005" width="21.8" height="15.0" fill="rgb(221,225,39)" rx="2" ry="2" />
+<text  x="1077.55" y="2015.5" >[..</text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="741" width="1.2" height="15.0" fill="rgb(218,222,15)" rx="2" ry="2" />
+<text  x="20.29" y="751.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="341" width="1.2" height="15.0" fill="rgb(237,34,11)" rx="2" ry="2" />
+<text  x="20.29" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="517" width="1.2" height="15.0" fill="rgb(234,105,12)" rx="2" ry="2" />
+<text  x="20.29" y="527.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="197.1" y="1989" width="6.1" height="15.0" fill="rgb(226,209,38)" rx="2" ry="2" />
+<text  x="200.15" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1147.5" y="2005" width="1.2" height="15.0" fill="rgb(234,1,34)" rx="2" ry="2" />
+<text  x="1150.47" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (157 times, 16.17%)</title><rect x="250.6" y="2005" width="190.8" height="15.0" fill="rgb(209,125,20)" rx="2" ry="2" />
+<text  x="253.62" y="2015.5" >do_page_fault</text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="85.3" y="2005" width="2.5" height="15.0" fill="rgb(249,28,13)" rx="2" ry="2" />
+<text  x="88.35" y="2015.5" ></text>
+</g>
+<g >
+<title>[libgjs.so.0.0.0] (18 times, 1.85%)</title><rect x="1074.6" y="2037" width="21.8" height="15.0" fill="rgb(209,183,48)" rx="2" ry="2" />
+<text  x="1077.55" y="2047.5" >[..</text>
+</g>
+<g >
+<title>do_page_fault (5 times, 0.51%)</title><rect x="539.8" y="2005" width="6.1" height="15.0" fill="rgb(231,38,8)" rx="2" ry="2" />
+<text  x="542.85" y="2015.5" ></text>
+</g>
+<g >
+<title>add_or_supercede_exported_var (1 times, 0.10%)</title><rect x="23.4" y="2021" width="1.2" height="15.0" fill="rgb(238,159,41)" rx="2" ry="2" />
+<text  x="26.37" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="1126.8" y="1957" width="4.9" height="15.0" fill="rgb(211,158,25)" rx="2" ry="2" />
+<text  x="1129.81" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="154.6" y="1957" width="1.2" height="15.0" fill="rgb(219,72,47)" rx="2" ry="2" />
+<text  x="157.61" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1397" width="1.2" height="15.0" fill="rgb(226,127,47)" rx="2" ry="2" />
+<text  x="20.29" y="1407.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="52.5" y="1957" width="1.2" height="15.0" fill="rgb(215,192,47)" rx="2" ry="2" />
+<text  x="55.53" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1186.4" y="1973" width="1.2" height="15.0" fill="rgb(242,113,49)" rx="2" ry="2" />
+<text  x="1189.35" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="507.0" y="2037" width="1.2" height="15.0" fill="rgb(208,15,31)" rx="2" ry="2" />
+<text  x="510.03" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="158.3" y="1989" width="1.2" height="15.0" fill="rgb(231,76,51)" rx="2" ry="2" />
+<text  x="161.26" y="1999.5" ></text>
+</g>
+<g >
+<title>__strchr_sse2 (1 times, 0.10%)</title><rect x="1100.1" y="1973" width="1.2" height="15.0" fill="rgb(251,58,29)" rx="2" ry="2" />
+<text  x="1103.07" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="514.3" y="2021" width="1.2" height="15.0" fill="rgb(218,216,24)" rx="2" ry="2" />
+<text  x="517.33" y="2031.5" ></text>
+</g>
+<g >
+<title>dl_main (14 times, 1.44%)</title><rect x="1121.9" y="2021" width="17.1" height="15.0" fill="rgb(226,205,47)" rx="2" ry="2" />
+<text  x="1124.95" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="191.1" y="1973" width="1.2" height="15.0" fill="rgb(219,62,43)" rx="2" ry="2" />
+<text  x="194.07" y="1983.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1143.8" y="2005" width="1.2" height="15.0" fill="rgb(233,137,46)" rx="2" ry="2" />
+<text  x="1146.82" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="441.4" y="1989" width="1.2" height="15.0" fill="rgb(209,165,4)" rx="2" ry="2" />
+<text  x="444.41" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1097.6" y="1941" width="1.3" height="15.0" fill="rgb(213,134,47)" rx="2" ry="2" />
+<text  x="1100.64" y="1951.5" ></text>
+</g>
+<g >
+<title>__register_atfork (1 times, 0.10%)</title><rect x="442.6" y="2037" width="1.2" height="15.0" fill="rgb(237,133,6)" rx="2" ry="2" />
+<text  x="445.63" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="458.4" y="1989" width="1.2" height="15.0" fill="rgb(247,37,9)" rx="2" ry="2" />
+<text  x="461.42" y="1999.5" ></text>
+</g>
+<g >
+<title>exp2f@@GLIBC_2.27 (1 times, 0.10%)</title><rect x="488.8" y="2005" width="1.2" height="15.0" fill="rgb(205,142,47)" rx="2" ry="2" />
+<text  x="491.81" y="2015.5" ></text>
+</g>
+<g >
+<title>[perl] (3 times, 0.31%)</title><rect x="160.7" y="2005" width="3.6" height="15.0" fill="rgb(240,28,18)" rx="2" ry="2" />
+<text  x="163.69" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1156.0" y="2021" width="1.2" height="15.0" fill="rgb(237,201,3)" rx="2" ry="2" />
+<text  x="1158.97" y="2031.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="18.5" y="1941" width="1.2" height="15.0" fill="rgb(228,149,51)" rx="2" ry="2" />
+<text  x="21.51" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="837" width="1.2" height="15.0" fill="rgb(252,208,25)" rx="2" ry="2" />
+<text  x="20.29" y="847.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1096.4" y="2005" width="1.2" height="15.0" fill="rgb(209,180,46)" rx="2" ry="2" />
+<text  x="1099.43" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="1125.6" y="1989" width="1.2" height="15.0" fill="rgb(207,112,46)" rx="2" ry="2" />
+<text  x="1128.59" y="1999.5" ></text>
+</g>
+<g >
+<title>[perf-33916.map] (1 times, 0.10%)</title><rect x="1095.2" y="1893" width="1.2" height="15.0" fill="rgb(215,190,6)" rx="2" ry="2" />
+<text  x="1098.21" y="1903.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="134.0" y="1989" width="1.2" height="15.0" fill="rgb(251,48,0)" rx="2" ry="2" />
+<text  x="136.95" y="1999.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="23.4" y="2005" width="1.2" height="15.0" fill="rgb(229,131,20)" rx="2" ry="2" />
+<text  x="26.37" y="2015.5" ></text>
+</g>
+<g >
+<title>page_fault (23 times, 2.37%)</title><rect x="460.9" y="1989" width="27.9" height="15.0" fill="rgb(242,40,34)" rx="2" ry="2" />
+<text  x="463.85" y="1999.5" >p..</text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="134.0" y="2021" width="1.2" height="15.0" fill="rgb(221,161,49)" rx="2" ry="2" />
+<text  x="136.95" y="2031.5" ></text>
+</g>
+<g >
+<title>execute_command_internal (2 times, 0.21%)</title><rect x="89.0" y="2053" width="2.4" height="15.0" fill="rgb(253,118,46)" rx="2" ry="2" />
+<text  x="91.99" y="2063.5" ></text>
+</g>
+<g >
+<title>_dl_sysdep_start (16 times, 1.65%)</title><rect x="1121.9" y="2037" width="19.5" height="15.0" fill="rgb(234,15,18)" rx="2" ry="2" />
+<text  x="1124.95" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="1173" width="1.2" height="15.0" fill="rgb(254,175,5)" rx="2" ry="2" />
+<text  x="20.29" y="1183.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="192.3" y="1957" width="1.2" height="15.0" fill="rgb(228,114,52)" rx="2" ry="2" />
+<text  x="195.29" y="1967.5" ></text>
+</g>
+<g >
+<title>page_fault (5 times, 0.51%)</title><rect x="549.6" y="2037" width="6.0" height="15.0" fill="rgb(250,136,54)" rx="2" ry="2" />
+<text  x="552.57" y="2047.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="51.3" y="2021" width="1.2" height="15.0" fill="rgb(227,103,16)" rx="2" ry="2" />
+<text  x="54.32" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="20.9" y="1925" width="1.3" height="15.0" fill="rgb(244,63,36)" rx="2" ry="2" />
+<text  x="23.94" y="1935.5" ></text>
+</g>
+<g >
+<title>do_page_fault (2 times, 0.21%)</title><rect x="57.4" y="2005" width="2.4" height="15.0" fill="rgb(214,95,4)" rx="2" ry="2" />
+<text  x="60.39" y="2015.5" ></text>
+</g>
+<g >
+<title>discard_unwind_frame (1 times, 0.10%)</title><rect x="55.0" y="2021" width="1.2" height="15.0" fill="rgb(205,212,29)" rx="2" ry="2" />
+<text  x="57.96" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="725" width="1.2" height="15.0" fill="rgb(250,31,46)" rx="2" ry="2" />
+<text  x="20.29" y="735.5" ></text>
+</g>
+<g >
+<title>Perl_newXS (1 times, 0.10%)</title><rect x="157.0" y="2005" width="1.3" height="15.0" fill="rgb(251,219,39)" rx="2" ry="2" />
+<text  x="160.04" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="509.5" y="2021" width="1.2" height="15.0" fill="rgb(227,117,7)" rx="2" ry="2" />
+<text  x="512.46" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1115.9" y="1989" width="1.2" height="15.0" fill="rgb(232,123,27)" rx="2" ry="2" />
+<text  x="1118.87" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="443.8" y="1989" width="1.3" height="15.0" fill="rgb(220,149,50)" rx="2" ry="2" />
+<text  x="446.84" y="1999.5" ></text>
+</g>
+<g >
+<title>__printf_fp (1 times, 0.10%)</title><rect x="192.3" y="1989" width="1.2" height="15.0" fill="rgb(220,108,44)" rx="2" ry="2" />
+<text  x="195.29" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="459.6" y="1957" width="1.3" height="15.0" fill="rgb(207,22,37)" rx="2" ry="2" />
+<text  x="462.64" y="1967.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1142.6" y="1989" width="1.2" height="15.0" fill="rgb(248,131,2)" rx="2" ry="2" />
+<text  x="1145.61" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="516.8" y="2021" width="1.2" height="15.0" fill="rgb(238,76,0)" rx="2" ry="2" />
+<text  x="519.76" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="613" width="1.2" height="15.0" fill="rgb(231,173,53)" rx="2" ry="2" />
+<text  x="20.29" y="623.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="137.6" y="2021" width="1.2" height="15.0" fill="rgb(217,78,30)" rx="2" ry="2" />
+<text  x="140.60" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (3 times, 0.31%)</title><rect x="1162.0" y="2005" width="3.7" height="15.0" fill="rgb(254,212,7)" rx="2" ry="2" />
+<text  x="1165.05" y="2015.5" ></text>
+</g>
+<g >
+<title>__memset_sse2_unaligned_erms (8 times, 0.82%)</title><rect x="1064.8" y="1909" width="9.8" height="15.0" fill="rgb(248,211,8)" rx="2" ry="2" />
+<text  x="1067.83" y="1919.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="1100.1" y="1925" width="1.2" height="15.0" fill="rgb(234,38,14)" rx="2" ry="2" />
+<text  x="1103.07" y="1935.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="1132.9" y="1973" width="4.8" height="15.0" fill="rgb(222,139,49)" rx="2" ry="2" />
+<text  x="1135.88" y="1983.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="74.4" y="2021" width="1.2" height="15.0" fill="rgb(240,59,45)" rx="2" ry="2" />
+<text  x="77.41" y="2031.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="115.7" y="2005" width="1.2" height="15.0" fill="rgb(234,79,1)" rx="2" ry="2" />
+<text  x="118.73" y="2015.5" ></text>
+</g>
+<g >
+<title>set_pipestatus_array (1 times, 0.10%)</title><rect x="73.2" y="2037" width="1.2" height="15.0" fill="rgb(215,45,0)" rx="2" ry="2" />
+<text  x="76.19" y="2047.5" ></text>
+</g>
+<g >
+<title>_dl_setup_hash (1 times, 0.10%)</title><rect x="1156.0" y="2037" width="1.2" height="15.0" fill="rgb(251,169,38)" rx="2" ry="2" />
+<text  x="1158.97" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="519.2" y="2005" width="1.2" height="15.0" fill="rgb(228,166,50)" rx="2" ry="2" />
+<text  x="522.19" y="2015.5" ></text>
+</g>
+<g >
+<title>[perl] (2 times, 0.21%)</title><rect x="123.0" y="2053" width="2.4" height="15.0" fill="rgb(228,222,43)" rx="2" ry="2" />
+<text  x="126.02" y="2063.5" ></text>
+</g>
+<g >
+<title>page_fault (1 times, 0.10%)</title><rect x="110.9" y="2037" width="1.2" height="15.0" fill="rgb(212,174,48)" rx="2" ry="2" />
+<text  x="113.87" y="2047.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="135.2" y="2005" width="1.2" height="15.0" fill="rgb(213,10,23)" rx="2" ry="2" />
+<text  x="138.17" y="2015.5" ></text>
+</g>
+<g >
+<title>do_page_fault (7 times, 0.72%)</title><rect x="62.3" y="1989" width="8.5" height="15.0" fill="rgb(221,118,25)" rx="2" ry="2" />
+<text  x="65.26" y="1999.5" ></text>
+</g>
+<g >
+<title>do_page_fault (4 times, 0.41%)</title><rect x="98.7" y="2021" width="4.9" height="15.0" fill="rgb(247,222,15)" rx="2" ry="2" />
+<text  x="101.71" y="2031.5" ></text>
+</g>
+<g >
+<title>_dl_map_object_from_fd (3 times, 0.31%)</title><rect x="1152.3" y="2037" width="3.7" height="15.0" fill="rgb(241,187,24)" rx="2" ry="2" />
+<text  x="1155.33" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 times, 0.10%)</title><rect x="17.3" y="949" width="1.2" height="15.0" fill="rgb(245,137,20)" rx="2" ry="2" />
+<text  x="20.29" y="959.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 times, 0.10%)</title><rect x="458.4" y="1973" width="1.2" height="15.0" fill="rgb(239,165,42)" rx="2" ry="2" />
+<text  x="461.42" y="1983.5" ></text>
+</g>
+<g >
+<title>__newlocale (1 times, 0.10%)</title><rect x="160.7" y="1989" width="1.2" height="15.0" fill="rgb(211,39,9)" rx="2" ry="2" />
+<text  x="163.69" y="1999.5" ></text>
+</g>
+</g>
+</svg>
